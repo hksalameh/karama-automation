@@ -1,4 +1,4 @@
-# Build current main after Karama slow-site wait improvements.
+# Build a single Windows executable for Karama Automation.
 name: Build Windows App
 
 on:
@@ -46,25 +46,20 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
-      - name: Build EXE and installer
+      - name: Build Windows app
         shell: pwsh
         run: .\build_exe.ps1
 
-      - name: Verify outputs
+      - name: Verify executable
         shell: pwsh
         run: |
           if (-not (Test-Path '.\dist\KafalaCompareApp.exe')) { throw 'EXE missing' }
-          if (-not (Test-Path '.\KafalaCompareApp_build.zip')) { throw 'Portable ZIP missing' }
-          if (-not (Test-Path '.\Output\KafalaCompareApp_setup.exe')) { throw 'Installer missing' }
-          Get-Item '.\dist\KafalaCompareApp.exe', '.\KafalaCompareApp_build.zip', '.\Output\KafalaCompareApp_setup.exe' | Format-Table Name, Length
+          Get-Item '.\dist\KafalaCompareApp.exe' | Format-Table Name, Length
 
-      - name: Upload Windows build
+      - name: Upload single Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: KafalaCompareApp-Windows
           if-no-files-found: error
           retention-days: 14
-          path: |
-            dist/KafalaCompareApp.exe
-            KafalaCompareApp_build.zip
-            Output/KafalaCompareApp_setup.exe
+          path: dist/KafalaCompareApp.exe
