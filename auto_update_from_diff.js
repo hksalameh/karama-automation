@@ -43,6 +43,28 @@ function loadRecords(file){
   return rows.map(r=>({natId:normDigits(r[nat]),name:String(name?r[name]:'').trim(),oldAmount:normAmount(r[old]),newAmount:normAmount(r[neu]),reason:String(reason?r[reason]:'').trim()})).filter(r=>r.natId&&r.newAmount!=='');
 }
 
+function loadComparisonSummary(file){
+  try{
+    const wb=xlsx.readFile(file,{cellDates:false});
+    const sheetName=wb.SheetNames.find(n=>normText(n).includes('ملخص'));
+    if(!sheetName)return {};
+    const rows=xlsx.utils.sheet_to_json(wb.Sheets[sheetName],{header:1,defval:'',raw:false});
+    const map={};
+    for(const row of rows.slice(1)){
+      if(!row||row.length<2)continue;
+      const key=normText(row[0]);
+      if(key)map[key]=String(row[1]??'').trim();
+    }
+    return {
+      careTotal:normAmount(map[normText('مجموع_برنامج_الرعاية')]||''),
+      expectedAfterAuto:normAmount(map[normText('المجموع_المتوقع_بعد_التعديل_الآلي')]||''),
+      reliable:String(map[normText('مطابقة_المجموع_موثوقة')]||'').trim(),
+      reviewCandidates:String(map[normText('حالات_مراجعة_مطابقة_محتملة')]||'').trim(),
+      missingInSite:String(map[normText('غير_موجود_بكرامة_بعد_استبعاد_المشتبه')]||'').trim(),
+    };
+  }catch(_){ return {}; }
+}
+
 async function launch(){
   const tries=[['Chrome',{channel:'chrome',headless:false}],['Edge',{channel:'msedge',headless:false}],['Chromium',{headless:false}]], errors=[];
   for(const [n,o] of tries){ try{ const b=await chromium.launch(o); log(`✅ تم تشغيل المتصفح: ${n}`); return b; }catch(e){ errors.push(`${n}: ${e.message||e}`); } }
@@ -153,17 +175,70 @@ async function tempSave(page){
   log('💾 انتهت جميع التعديلات. جاري تنفيذ حفظ مؤقت فقط...'); const btn=await clickable(page,'حفظ مؤقت'); if(!btn)throw new Error('لم أجد زر "حفظ مؤقت". لم يتم تنفيذ أي حفظ نهائي.'); if(finalSave(await label(btn)))throw new Error('حماية الأمان منعت زر حفظ نهائي.');
   const before=await cycle(page); await btn.click({timeout:FAIL_TIMEOUT}); await waitCycle(page,before,'استجابة الموقع بعد حفظ مؤقت'); await waitUntil(()=>bodyHas(page,'تم حفظ القيم بنجاح'),'ظهور رسالة نجاح الحفظ المؤقت'); log('✅ تم الحفظ المؤقت وظهرت رسالة النجاح.');
 }
-async function visibleTotal(page){ return page.evaluate(()=>{const n=v=>String(v||'').trim().replace(/\s+/g,' '),nodes=Array.from(document.querySelectorAll('td,th,span,label,div')),l=nodes.find(e=>n(e.innerText||e.textContent||'').includes('المجموع الكلي للصرفية'));if(!l)return '';const r=l.closest('tr')||l.parentElement,i=r?.querySelector('input');if(i?.value)return i.value;const m=n(r?.innerText||r?.textContent||'').match(/المجموع الكلي للصرفية\s*([\d.,]+)/);return m?m[1]:'';}).catch(()=>''); }
+
+async function visibleTotal(page){
+  return page.evaluate(()=>{
+    const n=v=>String(v||'').trim().replace(/\s+/g,' ');
+    const amount=v=>{const s=String(v||'').replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/,/g,'').replace(/[^\d.-]/g,'');return s&&Number.isFinite(Number(s))?s:'';};
+    const vis=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
+    const phrase='المجموع الكلي للصرفية';
+    const nodes=Array.from(document.querySelectorAll('td,th,span,label,div')).filter(e=>vis(e)&&n(e.innerText||e.textContent||'').includes(phrase));
+    nodes.sort((a,b)=>n(a.innerText||a.textContent||'').length-n(b.innerText||b.textContent||'').length);
+    const label=nodes[0]||null;
+    if(label){
+      let p=label;
+      for(let depth=0;depth<6&&p;depth++,p=p.parentElement){
+        const ins=Array.from(p.querySelectorAll('input')).filter(i=>vis(i)&&amount(i.value));
+        if(ins.length===1)return ins[0].value;
+        if(ins.length>1){
+          const lr=label.getBoundingClientRect();
+          ins.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();const ad=Math.abs((ar.top+ar.height/2)-(lr.top+lr.height/2))*8+Math.abs(ar.left-lr.left);const bd=Math.abs((br.top+br.height/2)-(lr.top+lr.height/2))*8+Math.abs(br.left-lr.left);return ad-bd;});
+          return ins[0].value;
+        }
+      }
+      const lr=label.getBoundingClientRect();
+      const ins=Array.from(document.querySelectorAll('input')).filter(i=>vis(i)&&amount(i.value));
+      ins.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();const ad=Math.abs((ar.top+ar.height/2)-(lr.top+lr.height/2))*10+Math.abs(ar.left-lr.left);const bd=Math.abs((br.top+br.height/2)-(lr.top+lr.height/2))*10+Math.abs(br.left-lr.left);return ad-bd;});
+      if(ins.length){const r=ins[0].getBoundingClientRect();if(Math.abs((r.top+r.height/2)-(lr.top+lr.height/2))<140)return ins[0].value;}
+    }
+    const body=n(document.body?.innerText||document.body?.textContent||'');
+    const m=body.match(/المجموع الكلي للصرفية\s*[:：]?\s*([\d٠-٩.,]+)/);
+    return m?m[1]:'';
+  }).catch(()=>'');
+}
+
+function amountsEqual(a,b){
+  const x=Number(normAmount(a)),y=Number(normAmount(b));
+  return Number.isFinite(x)&&Number.isFinite(y)&&Math.abs(x-y)<=0.0001;
+}
 
 async function main(){
-  const c=config(),records=loadRecords(c.excelPath); if(!records.length)throw new Error('لا توجد سجلات في ورقة "يحتاج تعديل".'); log(`📄 تم تحميل ${records.length} سجل يحتاج تعديل.`);
+  const c=config(),records=loadRecords(c.excelPath),comparisonSummary=loadComparisonSummary(c.excelPath); if(!records.length)throw new Error('لا توجد سجلات في ورقة "يحتاج تعديل".'); log(`📄 تم تحميل ${records.length} سجل يحتاج تعديل.`);
+  if(comparisonSummary.reviewCandidates&&comparisonSummary.reviewCandidates!=='0') log(`⚠️ توجد ${comparisonSummary.reviewCandidates} حالة مطابقة محتملة تم استبعادها من التعديل الآلي وتحتاج مراجعة يدوية.`);
   const dup=records.map(r=>r.natId).filter((id,i,a)=>a.indexOf(id)!==i); if(dup.length)throw new Error(`يوجد رقم وطني مكرر في ملف التعديل: ${[...new Set(dup)].join(', ')}`);
   const browser=await launch(),page=await browser.newPage(); page.setDefaultTimeout(FAIL_TIMEOUT); page.setDefaultNavigationTimeout(FAIL_TIMEOUT); const results=[]; let temporarySaved=false;
   try{
     await login(page,c); await goDisbursement(page); await configure(page,c); await installHelpers(page);
     log('🔎 فحص جميع السجلات قبل بدء أي تعديل...'); const errors=await preflight(page,records); if(errors.length){const p=errors.slice(0,8).map(e=>`${e.natId}: ${e.error}`).join(' | ');throw new Error(`فشل فحص الأمان قبل التعديل (${errors.length} سجل): ${p}`);} log('✅ تم التحقق من جميع السجلات. بدء التعديل السريع داخل الصفحة.');
     for(let i=0;i<records.length;i++){ try{results.push(await processRecord(page,records[i],i+1,records.length));}catch(e){results.push({...records[i],status:'error',error:e.message||String(e)});fs.writeFileSync(outPath(`auto_update_result_${Date.now()}.json`),JSON.stringify(results,null,2),'utf8');throw new Error(`توقفت العملية عند السجل ${i+1}/${records.length}: ${e.message||e}\nلم يتم الضغط على حفظ مؤقت.`);} }
-    await tempSave(page); temporarySaved=true; const total=await visibleTotal(page),report=outPath(`auto_update_result_${Date.now()}.json`); fs.writeFileSync(report,JSON.stringify({year:c.year,month:c.month,category:c.category,temporarySaved:true,visibleTotal:total,results},null,2),'utf8'); console.log(`__TEMP_SAVE_OK__|${total||''}|${report}`); log('🛑 انتهت مسؤولية البرنامج هنا. لن يتم الضغط على "حفظ نهائي" بأي شكل.'); log('👀 المتصفح سيبقى مفتوحاً للمراجعة والحفظ النهائي اليدوي.'); while(browser.isConnected())await sleep(1000);
-  }catch(e){fs.writeFileSync(outPath(`auto_update_error_${Date.now()}.json`),JSON.stringify({year:c.year,month:c.month,category:c.category,temporarySaved,error:e.message||String(e),results},null,2),'utf8');throw e;}
+    await tempSave(page); temporarySaved=true;
+    const total=await visibleTotal(page), expected=comparisonSummary.expectedAfterAuto||'', careTotal=comparisonSummary.careTotal||'';
+    let totalDisplay=total||'غير متاح', totalMatch=null, careMatch=null;
+    if(total&&expected){
+      totalMatch=amountsEqual(total,expected);
+      totalDisplay=`${total} — المتوقع ${expected} ${totalMatch?'✅':'❌'}`;
+      log(`${totalMatch?'✅':'❌'} المجموع بعد الحفظ المؤقت: كرامة ${total} / المتوقع بعد الأتمتة ${expected}.`);
+    }else{
+      log('⚠️ تعذر إجراء مطابقة المجموع لأن المجموع الظاهر أو المجموع المتوقع غير متاح.');
+    }
+    if(total&&careTotal){
+      careMatch=amountsEqual(total,careTotal);
+      log(`${careMatch?'✅':'⚠️'} مقارنة مجموع كرامة مع كامل برنامج الرعاية: كرامة ${total} / الرعاية ${careTotal}${careMatch?' — متطابق':' — يوجد فرق يحتاج مراجعة'}.`);
+    }
+    const report=outPath(`auto_update_result_${Date.now()}.json`);
+    fs.writeFileSync(report,JSON.stringify({year:c.year,month:c.month,category:c.category,temporarySaved:true,visibleTotal:total,expectedAfterAuto:expected,careTotal,totalMatch,careMatch,comparisonSummary,results},null,2),'utf8');
+    console.log(`__TEMP_SAVE_OK__|${totalDisplay}|${report}`);
+    log('🛑 انتهت مسؤولية البرنامج هنا. لن يتم الضغط على "حفظ نهائي" بأي شكل.'); log('👀 المتصفح سيبقى مفتوحاً للمراجعة والحفظ النهائي اليدوي.'); while(browser.isConnected())await sleep(1000);
+  }catch(e){fs.writeFileSync(outPath(`auto_update_error_${Date.now()}.json`),JSON.stringify({year:c.year,month:c.month,category:c.category,temporarySaved,error:e.message||String(e),comparisonSummary,results},null,2),'utf8');throw e;}
 }
 main().catch(e=>{const m=String(e.message||e).replace(/[\r\n]+/g,' ');console.error(`__FATAL__|${m}`);console.error(`❌ ${m}`);process.exitCode=1;});
