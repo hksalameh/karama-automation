@@ -1,0 +1,69 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'kafala_compare_app.py'
+      - 'auto_update_gui.py'
+      - 'auto_update_from_diff.js'
+      - 'KafalaCompareApp_fixed.spec'
+      - 'KafalaCompareApp.iss'
+      - 'build_exe.ps1'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pandas openpyxl xlrd
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build EXE and installer
+        shell: pwsh
+        run: .\build_exe.ps1
+
+      - name: Verify outputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '.\dist\KafalaCompareApp.exe')) { throw 'EXE missing' }
+          if (-not (Test-Path '.\KafalaCompareApp_build.zip')) { throw 'Portable ZIP missing' }
+          if (-not (Test-Path '.\Output\KafalaCompareApp_setup.exe')) { throw 'Installer missing' }
+          Get-Item '.\dist\KafalaCompareApp.exe', '.\KafalaCompareApp_build.zip', '.\Output\KafalaCompareApp_setup.exe' | Format-Table Name, Length
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KafalaCompareApp-Windows
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/KafalaCompareApp.exe
+            KafalaCompareApp_build.zip
+            Output/KafalaCompareApp_setup.exe
