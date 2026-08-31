@@ -6,10 +6,10 @@ const xlsx = require('xlsx');
 const LOGIN_URL = 'http://92.253.101.105:8040/ICCS/index.aspx';
 const DISBURSEMENT_URL_HINT = '/ICCS/Family_sub2.aspx';
 
-// مهلة قصوى فقط؛ الانتقال يتم فور تحقق استجابة الموقع.
-const SITE_ACTION_TIMEOUT_MS = 60000;
+// هذه حدود قصوى للحماية فقط؛ لا يوجد انتظار ثابت بين الخطوات.
+const SITE_ACTION_TIMEOUT_MS = 20000;
+const FIELD_CONFIRM_TIMEOUT_MS = 3000;
 const POLL_MS = 100;
-const FIELD_CONFIRM_TIMEOUT_MS = 5000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -63,7 +63,7 @@ async function waitUntil(check, description, timeoutMs = SITE_ACTION_TIMEOUT_MS)
   let lastError = '';
   while (Date.now() < deadline) {
     try {
-      if (await check()) return true;
+      if (await check()) return;
     } catch (err) {
       lastError = err?.message || String(err);
     }
@@ -166,63 +166,6 @@ function isFinalSaveLabel(label) {
   return normalized.includes('حفظ') && normalized.includes('نهائي');
 }
 
-async function waitUntilEnabled(locator, description, timeoutMs = SITE_ACTION_TIMEOUT_MS) {
-  await waitUntil(async () => {
-    return await locator.isVisible().catch(() => false) && await locator.isEnabled().catch(() => false);
-  }, `تفعيل ${description}`, timeoutMs);
-}
-
-async function bodyContains(page, wanted) {
-  const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
-  const list = Array.isArray(wanted) ? wanted : [wanted];
-  return list.some((text) => body.includes(normalizeText(text)));
-}
-
-async function pagePostbackToken(page) {
-  return page.evaluate(() => {
-    const valueOf = (selector) => document.querySelector(selector)?.value || '';
-    const viewState = valueOf('input[name="__VIEWSTATE"]');
-    const eventValidation = valueOf('input[name="__EVENTVALIDATION"]');
-    return `${location.href}|${viewState.slice(-120)}|${eventValidation.slice(-120)}`;
-  }).catch(() => 'page-transition');
-}
-
-async function clickAndWaitForSite(page, locator, description, verifyFn = null) {
-  await waitUntilEnabled(locator, description);
-
-  const label = await controlLabel(locator);
-  if (isFinalSaveLabel(label)) {
-    throw new Error(`حماية الأمان منعت الضغط على "${label}". زر الحفظ النهائي ممنوع تماماً.`);
-  }
-
-  const beforeToken = await pagePostbackToken(page);
-  let navigationCompleted = false;
-  const navigationPromise = page.waitForNavigation({
-    waitUntil: 'domcontentloaded',
-    timeout: SITE_ACTION_TIMEOUT_MS,
-  }).then(() => {
-    navigationCompleted = true;
-    return true;
-  }).catch(() => false);
-
-  log(`⏳ ${description}...`);
-  await locator.click({ timeout: SITE_ACTION_TIMEOUT_MS });
-
-  await waitUntil(async () => {
-    if (navigationCompleted) return true;
-    const afterToken = await pagePostbackToken(page);
-    return afterToken !== beforeToken;
-  }, `استجابة موقع كرامة بعد ${description}`);
-
-  // لا ننتظر مهلة ثابتة: بمجرد أن تظهر النتيجة المطلوبة نكمل فوراً.
-  if (verifyFn) {
-    await waitUntil(verifyFn, `اكتمال ${description}`);
-  }
-
-  // اترك الوعد ينتهي بدون تعطيل المسار إذا كان التغيير تم عبر postback غير تقليدي.
-  void navigationPromise;
-}
-
 async function findClickableByText(page, wantedText, { exact = true } = {}) {
   const wanted = normalizeText(wantedText);
   const controls = page.locator('button, input[type="submit"], input[type="button"], a');
@@ -232,6 +175,7 @@ async function findClickableByText(page, wantedText, { exact = true } = {}) {
     const control = controls.nth(i);
     try {
       if (!(await control.isVisible())) continue;
+      if (!(await control.isEnabled())) continue;
       const label = normalizeText(await controlLabel(control));
       if (isFinalSaveLabel(label)) continue;
       if ((exact && label === wanted) || (!exact && label.includes(wanted))) return control;
@@ -240,12 +184,18 @@ async function findClickableByText(page, wantedText, { exact = true } = {}) {
   return null;
 }
 
+async function bodyContains(page, wanted) {
+  const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
+  const values = Array.isArray(wanted) ? wanted : [wanted];
+  return values.some((value) => body.includes(normalizeText(value)));
+}
+
 async function login(page, config) {
   log('🌐 فتح صفحة الدخول...');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: SITE_ACTION_TIMEOUT_MS });
 
   const passwordInput = page.locator('input[type="password"]:visible').first();
-  await waitUntil(() => passwordInput.isVisible().catch(() => false), 'تحميل حقل كلمة المرور');
+  await waitUntil(() => passwordInput.isVisible().catch(() => false), 'ظهور حقل كلمة المرور');
 
   const textInputs = page.locator('input[type="text"]:visible, input:not([type]):visible');
   let usernameInput = null;
@@ -264,10 +214,12 @@ async function login(page, config) {
   const loginButton = await findClickableByText(page, 'دخول', { exact: true });
   if (!loginButton) throw new Error('لم أجد زر "دخول".');
 
-  await clickAndWaitForSite(page, loginButton, 'تسجيل الدخول', async () => {
-    return await bodyContains(page, ['القائمة الرئيسية', 'شاشة المعيل', 'شاشة المستفيدين']);
-  });
-
+  log('⏳ تسجيل الدخول...');
+  await loginButton.click({ timeout: SITE_ACTION_TIMEOUT_MS });
+  await waitUntil(
+    () => bodyContains(page, ['القائمة الرئيسية', 'شاشة المعيل', 'شاشة المستفيدين']),
+    'ظهور الصفحة الرئيسية بعد تسجيل الدخول'
+  );
   log('✅ تم تسجيل الدخول.');
 }
 
@@ -278,9 +230,11 @@ async function navigateToDisbursement(page) {
   const menuButton = await findClickableByText(page, 'شاشة الصرفية', { exact: true });
   if (!menuButton) throw new Error('لم أجد خيار "شاشة الصرفية" بعد تسجيل الدخول.');
 
-  await clickAndWaitForSite(page, menuButton, 'فتح شاشة الصرفية', async () => {
-    return page.url().includes('Family_sub2.aspx') || await bodyContains(page, ['شاشة الصرفيات', 'شاشه الصرفيات']);
-  });
+  await menuButton.click({ timeout: SITE_ACTION_TIMEOUT_MS });
+  await waitUntil(async () => {
+    if (page.url().includes('Family_sub2.aspx')) return true;
+    return bodyContains(page, ['شاشة الصرفيات', 'شاشه الصرفيات']);
+  }, 'ظهور شاشة الصرفية');
 
   log('✅ تم فتح شاشة الصرفية.');
 }
@@ -311,7 +265,6 @@ async function findCategorySelect(page) {
       best = select;
     }
   }
-
   return bestScore >= 4 ? best : null;
 }
 
@@ -332,7 +285,6 @@ async function findMonthSelect(page) {
       best = select;
     }
   }
-
   return bestScore >= 8 ? best : null;
 }
 
@@ -344,8 +296,8 @@ async function findYearInput(page) {
   for (let i = 0; i < await inputs.count(); i++) {
     const input = inputs.nth(i);
     try {
-      const type = (await input.getAttribute('type')) || 'text';
-      if (/hidden|submit|button|password|checkbox|radio|file/i.test(type)) continue;
+      const type = ((await input.getAttribute('type')) || 'text').toLowerCase();
+      if (/hidden|submit|button|password|checkbox|radio|file/.test(type)) continue;
       const current = normalizeDigits(await input.inputValue().catch(() => ''));
       const context = normalizeText(await input.evaluate((el) => (el.closest('tr')?.innerText || el.parentElement?.innerText || '')).catch(() => ''));
       let score = 0;
@@ -357,93 +309,127 @@ async function findYearInput(page) {
       }
     } catch (_) {}
   }
-
   return bestScore >= 5 ? best : null;
 }
 
-async function selectByText(select, wanted, description) {
-  await waitUntilEnabled(select, description);
-  const target = normalizeText(wanted);
+async function selectMonth(select, month) {
   const options = await select.locator('option').all();
+  for (const option of options) {
+    if (normalizeDigits(await option.textContent().catch(() => '')) !== month) continue;
+    const value = await option.getAttribute('value');
+    if (value === null) continue;
+    await select.selectOption(value);
+    await waitUntil(
+      async () => normalizeDigits(await select.locator('option:checked').first().textContent().catch(() => '')) === month,
+      `تأكيد اختيار الشهر ${month}`,
+      FIELD_CONFIRM_TIMEOUT_MS
+    );
+    return true;
+  }
+  return false;
+}
 
+async function selectCategory(select, category) {
+  const wanted = normalizeText(category);
+  const options = await select.locator('option').all();
   for (const option of options) {
     const text = normalizeText(await option.textContent().catch(() => ''));
-    if (text === target || text.includes(target) || target.includes(text)) {
-      const value = await option.getAttribute('value');
-      if (value === null) continue;
-      await select.selectOption(value);
-      await waitUntil(async () => {
-        const selectedText = normalizeText(await select.locator('option:checked').first().textContent().catch(() => ''));
-        return selectedText === target || selectedText.includes(target) || target.includes(selectedText);
-      }, `تأكيد ${description}`, FIELD_CONFIRM_TIMEOUT_MS);
-      return true;
-    }
-  }
-
-  return false;
-}
-
-async function selectMonth(select, month) {
-  await waitUntilEnabled(select, `قائمة الشهر ${month}`);
-  const options = await select.locator('option').all();
-  for (const option of options) {
-    if (normalizeDigits(await option.textContent().catch(() => '')) === month) {
-      const value = await option.getAttribute('value');
-      if (value === null) continue;
-      await select.selectOption(value);
-      await waitUntil(async () => normalizeDigits(await select.locator('option:checked').first().textContent().catch(() => '')) === month,
-        `تأكيد اختيار الشهر ${month}`, FIELD_CONFIRM_TIMEOUT_MS);
-      return true;
-    }
+    if (!(text === wanted || text.includes(wanted) || wanted.includes(text))) continue;
+    const value = await option.getAttribute('value');
+    if (value === null) continue;
+    await select.selectOption(value);
+    await waitUntil(async () => {
+      const selected = normalizeText(await select.locator('option:checked').first().textContent().catch(() => ''));
+      return selected === wanted || selected.includes(wanted) || wanted.includes(selected);
+    }, `تأكيد اختيار التصنيف ${category}`, FIELD_CONFIRM_TIMEOUT_MS);
+    return true;
   }
   return false;
 }
 
-async function tableHasRequestedConfig(page, config) {
+async function indexDisbursementTable(page, config) {
   return page.evaluate(({ year, month, category }) => {
-    const norm = (value) => String(value || '')
+    const normText = (value) => String(value || '')
       .trim()
       .replace(/[أإآ]/g, 'ا')
       .replace(/ى/g, 'ي')
       .replace(/ة/g, 'ه')
       .replace(/ـ/g, '')
       .replace(/\s+/g, ' ');
-    const digits = (value) => String(value || '').replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[^\d]/g, '');
-    const wantedCategory = norm(category);
+    const digits = (value) => String(value || '')
+      .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+      .replace(/[^\d]/g, '');
+    const wantedCategory = normText(category);
+
+    for (const old of document.querySelectorAll('[data-karama-nat]')) old.removeAttribute('data-karama-nat');
+    for (const old of document.querySelectorAll('[data-karama-amount]')) old.removeAttribute('data-karama-amount');
 
     for (const table of Array.from(document.querySelectorAll('table'))) {
-      const ownRows = Array.from(table.rows || []);
+      const rows = Array.from(table.rows || []);
       let header = null;
-      for (const row of ownRows) {
+      let headerRow = null;
+
+      for (const row of rows) {
         const cells = Array.from(row.cells || []);
-        const texts = cells.map((cell) => norm(cell.innerText || cell.textContent || ''));
+        const texts = cells.map((cell) => normText(cell.innerText || cell.textContent || ''));
         if (texts.some((x) => x.includes('الرقم الوطني')) && texts.some((x) => x.includes('القيم'))) {
           header = texts;
+          headerRow = row;
           break;
         }
       }
-      if (!header) continue;
+      if (!header || !headerRow) continue;
 
       const idxNat = header.findIndex((x) => x.includes('الرقم الوطني'));
+      const idxValue = header.findIndex((x) => x === 'القيمه' || x === 'القيمة' || x.includes('القيمه') || x.includes('القيمة'));
       const idxMonth = header.findIndex((x) => x.includes('الشهر'));
       const idxYear = header.findIndex((x) => x.includes('السنه') || x.includes('السنة'));
       const idxCategory = header.findIndex((x) => x.includes('التصنيف'));
 
-      for (const row of ownRows) {
+      if (idxNat < 0 || idxValue < 0) continue;
+
+      const seen = new Map();
+      let matchedConfig = false;
+      let indexedCount = 0;
+
+      for (const row of rows) {
+        if (row === headerRow) continue;
         const cells = Array.from(row.cells || []);
-        if (cells.length <= Math.max(idxNat, idxMonth, idxYear, idxCategory)) continue;
-        const nat = idxNat >= 0 ? digits(cells[idxNat]?.innerText || cells[idxNat]?.textContent || '') : '';
+        if (cells.length <= Math.max(idxNat, idxValue)) continue;
+
+        const nat = digits(cells[idxNat]?.innerText || cells[idxNat]?.textContent || '');
         if (nat.length < 8) continue;
-        const m = idxMonth >= 0 ? digits(cells[idxMonth]?.innerText || cells[idxMonth]?.textContent || '') : '';
-        const y = idxYear >= 0 ? digits(cells[idxYear]?.innerText || cells[idxYear]?.textContent || '') : '';
-        const c = idxCategory >= 0 ? norm(cells[idxCategory]?.innerText || cells[idxCategory]?.textContent || '') : '';
-        if (m === String(month) && y === String(year) && (c === wantedCategory || c.includes(wantedCategory) || wantedCategory.includes(c))) {
-          return true;
+
+        const rowMonth = idxMonth >= 0 && idxMonth < cells.length ? digits(cells[idxMonth]?.innerText || cells[idxMonth]?.textContent || '') : '';
+        const rowYear = idxYear >= 0 && idxYear < cells.length ? digits(cells[idxYear]?.innerText || cells[idxYear]?.textContent || '') : '';
+        const rowCategory = idxCategory >= 0 && idxCategory < cells.length ? normText(cells[idxCategory]?.innerText || cells[idxCategory]?.textContent || '') : '';
+
+        if ((idxMonth < 0 || rowMonth === String(month)) &&
+            (idxYear < 0 || rowYear === String(year)) &&
+            (idxCategory < 0 || rowCategory === wantedCategory || rowCategory.includes(wantedCategory) || wantedCategory.includes(rowCategory))) {
+          matchedConfig = true;
         }
+
+        seen.set(nat, (seen.get(nat) || 0) + 1);
+        row.setAttribute('data-karama-nat', nat);
+
+        const valueCell = cells[idxValue];
+        const candidates = Array.from(valueCell?.querySelectorAll('input') || []).filter((input) => {
+          const type = String(input.getAttribute('type') || 'text').toLowerCase();
+          return !/hidden|button|submit|checkbox|radio|image/.test(type) && !input.disabled && !input.readOnly;
+        });
+        if (candidates.length === 1) {
+          candidates[0].setAttribute('data-karama-amount', '1');
+        }
+        indexedCount += 1;
       }
+
+      const duplicates = Array.from(seen.entries()).filter(([, count]) => count > 1).map(([nat]) => nat);
+      return { found: true, matchedConfig, indexedCount, duplicates };
     }
-    return false;
-  }, config).catch(() => false);
+
+    return { found: false, matchedConfig: false, indexedCount: 0, duplicates: [] };
+  }, config).catch(() => ({ found: false, matchedConfig: false, indexedCount: 0, duplicates: [] }));
 }
 
 async function configureDisbursement(page, config) {
@@ -459,168 +445,129 @@ async function configureDisbursement(page, config) {
   }
 
   const categorySelect = await findCategorySelect(page);
-  if (!categorySelect || !(await selectByText(categorySelect, config.category, `اختيار التصنيف ${config.category}`))) {
+  if (!categorySelect || !(await selectCategory(categorySelect, config.category))) {
     throw new Error(`لم أجد التصنيف "${config.category}" في قائمة التصنيفات.`);
   }
 
   const showButton = await findClickableByText(page, 'عرض', { exact: true });
   if (!showButton) throw new Error('لم أجد زر "عرض" في شاشة الصرفية.');
 
-  await clickAndWaitForSite(page, showButton, 'عرض الصرفية', () => tableHasRequestedConfig(page, config));
-  log('✅ تم عرض الصرفية المطلوبة.');
-}
+  log('⏳ عرض الصرفية...');
+  await showButton.click({ timeout: SITE_ACTION_TIMEOUT_MS });
 
-function nameLooksLikeMatch(rowText, expectedName) {
-  const expected = normalizeText(expectedName);
-  if (!expected) return true;
-  const row = normalizeText(rowText);
-  if (row.includes(expected)) return true;
+  let tableInfo = null;
+  await waitUntil(async () => {
+    tableInfo = await indexDisbursementTable(page, config);
+    return tableInfo.found && tableInfo.matchedConfig && tableInfo.indexedCount > 0;
+  }, 'ظهور أسماء وبيانات الصرفية المطلوبة');
 
-  const tokens = expected.split(' ').filter((token) => token.length >= 3);
-  if (!tokens.length) return true;
-  const matched = tokens.filter((token) => row.includes(token)).length;
-  return matched >= Math.min(3, tokens.length);
-}
-
-async function directCells(row) {
-  return row.locator(':scope > td, :scope > th');
-}
-
-async function findRowByNatId(page, record) {
-  const rows = page.locator('tr:visible');
-  const matches = [];
-
-  for (let i = 0; i < await rows.count(); i++) {
-    const row = rows.nth(i);
-    const cells = await directCells(row);
-    const cellCount = await cells.count();
-    if (cellCount < 2) continue;
-
-    let hasExactNatId = false;
-    const cellTexts = [];
-    for (let c = 0; c < cellCount; c++) {
-      const text = await cells.nth(c).textContent().catch(() => '');
-      cellTexts.push(text || '');
-      if (normalizeDigits(text) === record.natId) hasExactNatId = true;
-    }
-    if (!hasExactNatId) continue;
-
-    const rowText = cellTexts.join(' ');
-    if (!nameLooksLikeMatch(rowText, record.name)) {
-      throw new Error(`وجدت الرقم الوطني ${record.natId} لكن الاسم في نفس الصف لا يطابق الاسم في ملف المقارنة.`);
-    }
-    matches.push(row);
+  if (tableInfo.duplicates.length) {
+    throw new Error(`يوجد رقم وطني مكرر في جدول موقع كرامة: ${tableInfo.duplicates.slice(0, 10).join(', ')}`);
   }
 
-  if (matches.length === 0) return null;
-  if (matches.length > 1) {
-    throw new Error(`وجدت أكثر من صف مباشر للرقم الوطني ${record.natId}. تم إيقاف العملية للحماية.`);
-  }
-  return matches[0];
+  log(`✅ ظهرت الصرفية وتم تجهيز ${tableInfo.indexedCount} سجل للبحث السريع.`);
 }
 
-async function editableInputsInRow(row) {
-  const inputs = row.locator(':scope > td input, :scope > th input');
-  const out = [];
-  for (let i = 0; i < await inputs.count(); i++) {
-    const input = inputs.nth(i);
-    const type = ((await input.getAttribute('type')) || 'text').toLowerCase();
-    if (/hidden|button|submit|checkbox|radio|image/.test(type)) continue;
-    if (!(await input.isVisible().catch(() => false))) continue;
-    if (!(await input.isEditable().catch(() => false))) continue;
-    out.push(input);
-  }
-  return out;
-}
-
-async function amountColumnIndex(row) {
-  return row.evaluate((tr) => {
-    const norm = (value) => String(value || '')
+async function processRecordFast(page, record) {
+  return page.evaluate((record) => {
+    const normText = (value) => String(value || '')
       .trim()
       .replace(/[أإآ]/g, 'ا')
       .replace(/ى/g, 'ي')
       .replace(/ة/g, 'ه')
       .replace(/ـ/g, '')
       .replace(/\s+/g, ' ');
+    const normAmount = (value) => {
+      const s = String(value ?? '')
+        .trim()
+        .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+        .replace(/,/g, '')
+        .replace(/[^\d.-]/g, '');
+      if (!s) return '';
+      const n = Number(s);
+      return Number.isFinite(n) ? String(n) : s;
+    };
 
-    const table = tr.closest('table');
-    if (!table) return -1;
-    for (const headerRow of Array.from(table.rows || [])) {
-      const cells = Array.from(headerRow.cells || []);
-      const texts = cells.map((cell) => norm(cell.innerText || cell.textContent || ''));
-      if (!texts.some((text) => text.includes('الرقم الوطني'))) continue;
-      const idx = texts.findIndex((text) => text === 'القيمه' || text === 'القيمة' || text.includes('القيمه') || text.includes('القيمة'));
-      if (idx >= 0) return idx;
-    }
-    return -1;
-  }).catch(() => -1);
-}
+    const rows = Array.from(document.querySelectorAll(`tr[data-karama-nat="${record.natId}"]`));
+    if (rows.length === 0) return { ok: false, error: `لم أجد الرقم الوطني ${record.natId} داخل الصرفية المعروضة.` };
+    if (rows.length > 1) return { ok: false, error: `وجدت أكثر من صف للرقم الوطني ${record.natId}.` };
 
-async function findAmountInput(row, record) {
-  const inputs = await editableInputsInRow(row);
-
-  // الطريقة الأقوى: المبلغ الموجود في ملف كرامة يجب أن يوجد في خانة القيمة لهذا الصف نفسه.
-  const exactOldMatches = [];
-  for (const input of inputs) {
-    const value = normalizeAmount(await input.inputValue().catch(() => ''));
-    if (value === record.oldAmount) exactOldMatches.push(input);
-  }
-  if (exactOldMatches.length === 1) {
-    log(`🔎 حقل القيمة ${record.natId}: تطابق المبلغ القديم داخل الصف الصحيح`);
-    return exactOldMatches[0];
-  }
-
-  // احتياط: استخدم عمود "القيمة" في نفس الجدول ونفس الصف المباشر فقط.
-  const index = await amountColumnIndex(row);
-  const cells = await directCells(row);
-  if (index >= 0 && index < await cells.count()) {
-    const cellInputs = cells.nth(index).locator('input');
-    const editable = [];
-    for (let i = 0; i < await cellInputs.count(); i++) {
-      const input = cellInputs.nth(i);
-      if (await input.isVisible().catch(() => false) && await input.isEditable().catch(() => false)) editable.push(input);
-    }
-    if (editable.length === 1) {
-      const current = normalizeAmount(await editable[0].inputValue().catch(() => ''));
-      if (current === record.oldAmount || current === record.newAmount) {
-        log(`🔎 حقل القيمة ${record.natId}: عمود القيمة داخل الصف الصحيح`);
-        return editable[0];
+    const row = rows[0];
+    const rowText = normText(row.innerText || row.textContent || '');
+    const expectedName = normText(record.name);
+    if (expectedName) {
+      const tokens = expectedName.split(' ').filter((token) => token.length >= 3);
+      const exact = rowText.includes(expectedName);
+      const matched = tokens.filter((token) => rowText.includes(token)).length;
+      if (!exact && tokens.length && matched < Math.min(3, tokens.length)) {
+        return { ok: false, error: `وجدت الرقم الوطني ${record.natId} لكن الاسم في نفس الصف لا يطابق ملف المقارنة.` };
       }
     }
-  }
 
-  const debug = [];
-  for (const input of inputs) {
-    debug.push(normalizeAmount(await input.inputValue().catch(() => '')) || '(فارغ)');
-  }
-  throw new Error(`لم أستطع تحديد حقل القيمة بثقة للرقم الوطني ${record.natId}. قيم الحقول في الصف الصحيح: ${debug.join('، ') || 'لا توجد حقول'}`);
+    let input = row.querySelector('input[data-karama-amount="1"]');
+    if (!input) {
+      const candidates = Array.from(row.querySelectorAll('input')).filter((el) => {
+        const type = String(el.getAttribute('type') || 'text').toLowerCase();
+        return !/hidden|button|submit|checkbox|radio|image/.test(type) && !el.disabled && !el.readOnly;
+      });
+      const oldMatches = candidates.filter((el) => normAmount(el.value) === record.oldAmount);
+      if (oldMatches.length === 1) input = oldMatches[0];
+    }
+
+    if (!input) {
+      return { ok: false, error: `لم أستطع تحديد حقل القيمة بثقة للرقم الوطني ${record.natId}.` };
+    }
+
+    const current = normAmount(input.value);
+    const target = normAmount(record.newAmount);
+    const old = normAmount(record.oldAmount);
+
+    if (current === target) {
+      return { ok: true, status: 'already_correct', current, target };
+    }
+    if (old !== '' && current !== old) {
+      return {
+        ok: false,
+        error: `القيمة الحالية في صف الرقم ${record.natId} هي (${current}) بينما ملف كرامة يحتوي (${old}). لم يتم التعديل.`
+      };
+    }
+
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(input, target);
+    else input.value = target;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const after = normAmount(input.value);
+    if (after !== target) {
+      return { ok: false, error: `تعذر تثبيت القيمة ${target} للرقم الوطني ${record.natId}.` };
+    }
+
+    return { ok: true, status: 'changed', current, target };
+  }, record);
 }
 
 async function processRecord(page, record, index, total) {
   progress(index, total, record, 'جاري البحث');
+  const result = await processRecordFast(page, record);
+  if (!result.ok) throw new Error(result.error || `خطأ غير معروف عند الرقم ${record.natId}`);
 
-  const row = await findRowByNatId(page, record);
-  if (!row) throw new Error(`لم أجد الرقم الوطني ${record.natId} داخل الصرفية المعروضة.`);
-
-  const input = await findAmountInput(row, record);
-  const current = normalizeAmount(await input.inputValue().catch(() => ''));
-  const target = normalizeAmount(record.newAmount);
-
-  if (current === target) {
+  if (result.status === 'already_correct') {
     progress(index, total, record, 'صحيح مسبقاً');
-    return { ...record, status: 'already_correct', current };
+    return { ...record, status: 'already_correct', current: result.current };
   }
-
-  if (current !== record.oldAmount) {
-    throw new Error(`القيمة الحالية في صف الرقم ${record.natId} هي (${current}) بينما ملف كرامة يحتوي (${record.oldAmount}). لم يتم التعديل.`);
-  }
-
-  await input.fill(target);
-  await waitUntil(async () => normalizeAmount(await input.inputValue().catch(() => '')) === target,
-    `تأكيد تعديل الرقم ${record.natId}`, FIELD_CONFIRM_TIMEOUT_MS);
 
   progress(index, total, record, 'تم التعديل');
-  return { ...record, status: 'changed', current, newAmount: target };
+  return { ...record, status: 'changed', current: result.current, newAmount: result.target };
+}
+
+async function pagePostbackToken(page) {
+  return page.evaluate(() => {
+    const valueOf = (name) => document.querySelector(`input[name="${name}"]`)?.value || '';
+    const viewState = valueOf('__VIEWSTATE');
+    const eventValidation = valueOf('__EVENTVALIDATION');
+    return `${location.href}|${viewState.slice(-150)}|${eventValidation.slice(-150)}`;
+  }).catch(() => '');
 }
 
 async function clickTemporarySave(page) {
@@ -633,7 +580,20 @@ async function clickTemporarySave(page) {
     throw new Error('حماية الأمان منعت الضغط على زر مشتبه أنه حفظ نهائي.');
   }
 
-  await clickAndWaitForSite(page, tempButton, 'الحفظ المؤقت', () => bodyContains(page, 'تم حفظ القيم بنجاح'));
+  const successText = 'تم حفظ القيم بنجاح';
+  const beforeToken = await pagePostbackToken(page);
+  const successBefore = await bodyContains(page, successText);
+
+  await tempButton.click({ timeout: SITE_ACTION_TIMEOUT_MS });
+
+  await waitUntil(async () => {
+    const successNow = await bodyContains(page, successText);
+    if (successNow && !successBefore) return true;
+    const afterToken = await pagePostbackToken(page);
+    return afterToken && beforeToken && afterToken !== beforeToken;
+  }, 'استجابة الحفظ المؤقت');
+
+  await waitUntil(() => bodyContains(page, successText), 'رسالة نجاح الحفظ المؤقت');
   log('✅ تم الحفظ المؤقت وظهرت رسالة نجاح الحفظ.');
 }
 
@@ -677,6 +637,8 @@ async function main() {
     await login(page, config);
     await navigateToDisbursement(page);
     await configureDisbursement(page, config);
+
+    log('⚡ تم تجهيز الجدول. ستتم التعديلات التالية مباشرة دون انتظار بين سجل وآخر.');
 
     for (let i = 0; i < records.length; i++) {
       const record = records[i];
