@@ -1,3 +1,4 @@
+# Build current main after Karama slow-site wait improvements.
 name: Build Windows App
 
 on:
