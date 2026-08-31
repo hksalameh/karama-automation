@@ -75,12 +75,37 @@ async function goDisbursement(page){
   await btn.click({timeout:FAIL_TIMEOUT}); await waitUntil(async()=>page.url().includes('Family_sub2.aspx')||await bodyHas(page,['شاشة الصرفيات','شاشه الصرفيات']),'ظهور شاشة الصرفية'); log('✅ تم فتح شاشة الصرفية.');
 }
 
-async function selectInfo(sel){ return sel.evaluate(e=>({options:Array.from(e.options||[]).map(o=>(o.textContent||'').trim()),parent:(e.closest('tr')?.innerText||e.parentElement?.innerText||'').trim()})).catch(()=>({options:[],parent:''})); }
-async function monthSelect(page){ const ss=page.locator('select:visible'); let best=null,score=-1; for(let i=0;i<await ss.count();i++){ const s=ss.nth(i),d=await selectInfo(s),vals=new Set(d.options.map(normDigits).filter(Boolean)); let x=[...Array(12)].every((_,k)=>vals.has(String(k+1)))?8:0; if(normText(d.parent).includes('شهر'))x+=4; if(x>score){score=x;best=s;} } return score>=8?best:null; }
-async function categorySelect(page){ const ss=page.locator('select:visible'); let best=null,score=-1; for(let i=0;i<await ss.count();i++){ const s=ss.nth(i),d=await selectInfo(s),o=d.options.map(normText); let x=0; if(o.some(v=>v.includes('ايتام')))x+=4; if(o.some(v=>v.includes('اسر')))x+=4; if(o.some(v=>v.includes('طلاب علم')))x+=4; if(normText(d.parent).includes('تصنيف الاسره'))x+=5; if(x>score){score=x;best=s;} } return score>=4?best:null; }
-async function yearInput(page){ const ins=page.locator('input:visible'); let best=null,score=-1; for(let i=0;i<await ins.count();i++){ const e=ins.nth(i); try{ const type=((await e.getAttribute('type'))||'text').toLowerCase(); if(/hidden|submit|button|password|checkbox|radio|file/.test(type))continue; const val=normDigits(await e.inputValue().catch(()=>'')),ctx=normText(await e.evaluate(x=>x.closest('tr')?.innerText||x.parentElement?.innerText||'').catch(()=>'')); let s=/^\d{4}$/.test(val)?5:0; if(ctx.includes('سنه')||ctx.includes('سنة'))s+=6; if(s>score){score=s;best=e;} }catch(_){} } return score>=5?best:null; }
-async function chooseMonth(sel,wanted){ for(const o of await sel.locator('option').all()){ if(normDigits(await o.textContent().catch(()=>''))===wanted){ const v=await o.getAttribute('value'); if(v!==null){ await sel.selectOption(v); return true; } } } return false; }
-async function chooseCategory(sel,wanted){ const w=normText(wanted); for(const o of await sel.locator('option').all()){ const t=normText(await o.textContent().catch(()=>'')); if(t===w||t.includes(w)||w.includes(t)){ const v=await o.getAttribute('value'); if(v!==null){ await sel.selectOption(v); return true; } } } return false; }
+async function prepareFiltersDirect(page,c){
+  return page.evaluate(({year,month,category})=>{
+    const nt=v=>String(v||'').trim().replace(/[أإآ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').replace(/ـ/g,'').replace(/\s+/g,' ');
+    const dg=v=>String(v||'').replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/\D/g,'');
+    const vis=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
+    const wanted=nt(category);
+    let monthSel=null, categorySel=null, yearInp=null;
+    for(const s of document.querySelectorAll('select')){
+      if(!vis(s))continue;
+      const opts=Array.from(s.options||[]), texts=opts.map(o=>nt(o.textContent||'')), vals=new Set(texts.map(dg).filter(Boolean));
+      if(!monthSel&&Array.from({length:12},(_,i)=>String(i+1)).every(m=>vals.has(m)))monthSel=s;
+      if(!categorySel&&texts.some(x=>x.includes('ايتام'))&&texts.some(x=>x.includes('اسر'))&&texts.some(x=>x.includes('طلاب علم')))categorySel=s;
+    }
+    for(const i of document.querySelectorAll('input')){
+      if(!vis(i)||/hidden|submit|button|password|checkbox|radio|file/.test(String(i.type||'text').toLowerCase()))continue;
+      const val=dg(i.value),ctx=nt(i.closest('tr')?.innerText||i.parentElement?.innerText||'');
+      if((/^\d{4}$/.test(val)||ctx.includes('سنه')||ctx.includes('سنة'))&&(ctx.includes('سنه')||ctx.includes('سنة'))){yearInp=i;break;}
+    }
+    if(!yearInp)return {ok:false,error:'لم أجد حقل السنة.'};
+    if(!monthSel)return {ok:false,error:'لم أجد قائمة الشهر.'};
+    if(!categorySel)return {ok:false,error:'لم أجد قائمة التصنيف.'};
+    const monthOpt=Array.from(monthSel.options||[]).find(o=>dg(o.textContent||'')===String(month));
+    const categoryOpt=Array.from(categorySel.options||[]).find(o=>{const t=nt(o.textContent||'');return t===wanted||t.includes(wanted)||wanted.includes(t);});
+    if(!monthOpt)return {ok:false,error:`لم أجد الشهر ${month}.`};
+    if(!categoryOpt)return {ok:false,error:`لم أجد التصنيف ${category}.`};
+    yearInp.value=String(year);
+    monthSel.value=monthOpt.value;
+    categorySel.value=categoryOpt.value;
+    return {ok:true,year:dg(yearInp.value),month:dg(monthSel.options?.[monthSel.selectedIndex]?.textContent||''),category:nt(categorySel.options?.[categorySel.selectedIndex]?.textContent||'')};
+  },c);
+}
 
 async function screenState(page){
   return page.evaluate(()=>{
@@ -94,10 +119,16 @@ async function screenState(page){
 }
 
 async function configure(page,c){
-  log(`⚙️ تجهيز الصرفية: سنة ${c.year}، شهر ${c.month}، تصنيف ${c.category}`); const y=await yearInput(page); if(!y)throw new Error('لم أجد حقل السنة.'); await y.fill(c.year);
-  const m=await monthSelect(page); if(!m||!await chooseMonth(m,c.month))throw new Error(`لم أجد الشهر ${c.month}.`); const cat=await categorySelect(page); if(!cat||!await chooseCategory(cat,c.category))throw new Error(`لم أجد التصنيف "${c.category}".`);
-  const show=await clickable(page,'عرض'); if(!show)throw new Error('لم أجد زر "عرض".'); const before=await cycle(page); log('⏳ عرض الصرفية...'); await show.click({timeout:FAIL_TIMEOUT}); await waitCycle(page,before,'تحديث صفحة الصرفية بعد عرض');
-  const wanted=normText(c.category); const state=await waitUntil(async()=>{ const s=await screenState(page),sc=normText(s.category); if(s.rows>0&&s.month===c.month&&(!s.year||s.year===c.year)&&(!sc||sc===wanted||sc.includes(wanted)||wanted.includes(sc)))return s; return null; },'ظهور صفوف الصرفية');
+  log(`⚙️ تجهيز الصرفية: سنة ${c.year}، شهر ${c.month}، تصنيف ${c.category}`);
+  const started=Date.now();
+  const prepared=await prepareFiltersDirect(page,c);
+  if(!prepared.ok)throw new Error(prepared.error||'تعذر ضبط خيارات الصرفية.');
+  const wanted=normText(c.category), selectedCat=normText(prepared.category);
+  if(prepared.year!==c.year||prepared.month!==c.month||!(selectedCat===wanted||selectedCat.includes(wanted)||wanted.includes(selectedCat))) throw new Error('لم يتم تثبيت السنة/الشهر/التصنيف بالقيم المطلوبة قبل العرض.');
+  log(`✅ تم ضبط خيارات الصرفية مباشرة (${Date.now()-started}ms).`);
+  const show=await clickable(page,'عرض'); if(!show)throw new Error('لم أجد زر "عرض".');
+  const before=await cycle(page); log('⏳ عرض الصرفية...'); await show.click({timeout:FAIL_TIMEOUT}); await waitCycle(page,before,'تحديث صفحة الصرفية بعد عرض');
+  const state=await waitUntil(async()=>{ const s=await screenState(page),sc=normText(s.category); if(s.rows>0&&s.month===c.month&&(!s.year||s.year===c.year)&&(!sc||sc===wanted||sc.includes(wanted)||wanted.includes(sc)))return s; return null; },'ظهور صفوف الصرفية');
   log(`✅ ظهرت الصرفية وأصبحت جاهزة (${state.rows} صف قابل للتعديل).`);
 }
 
