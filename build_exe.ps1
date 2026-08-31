@@ -1,57 +1,113 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$distDir = Join-Path $PSScriptRoot "dist"
-$buildDir = Join-Path $PSScriptRoot "build"
+$distDir = Join-Path $PSScriptRoot 'dist'
+$buildDir = Join-Path $PSScriptRoot 'build'
+$runtimeDir = Join-Path $PSScriptRoot 'KafalaCompareApp_build'
 $resolvedRoot = (Resolve-Path $PSScriptRoot).Path
+
+function Assert-InProject([string]$PathToCheck) {
+    if (-not (Test-Path $PathToCheck)) { return }
+    $resolved = (Resolve-Path $PathToCheck).Path
+    if (-not $resolved.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to modify outside project folder: $resolved"
+    }
+}
 
 foreach ($dir in @($distDir, $buildDir)) {
     if (Test-Path $dir) {
-        $resolvedDir = (Resolve-Path $dir).Path
-        if (-not $resolvedDir.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to clean outside project folder: $resolvedDir"
-        }
-        Remove-Item -LiteralPath $resolvedDir -Recurse -Force
+        Assert-InProject $dir
+        Remove-Item -LiteralPath $dir -Recurse -Force
     }
 }
 
-# Run PyInstaller with the corrected spec file.
-py -3 -m PyInstaller --clean --noconfirm KafalaCompareApp_fixed.spec
+# Prepare the Node.js runtime that PyInstaller bundles inside the EXE.
+# This makes the repository buildable on a clean Windows machine / GitHub Actions.
+if (Test-Path $runtimeDir) {
+    Assert-InProject $runtimeDir
+    Remove-Item -LiteralPath $runtimeDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $runtimeDir | Out-Null
 
-# Create portable zip from the clean output.
-$zipPath = Join-Path $PSScriptRoot "KafalaCompareApp_build.zip"
+$nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+}
+if (-not $nodeCommand) {
+    throw 'Node.js was not found. Install Node.js 22 or run the GitHub Actions build workflow.'
+}
+
+Copy-Item -LiteralPath $nodeCommand.Source -Destination (Join-Path $runtimeDir 'node.exe') -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'package.json') -Destination $runtimeDir -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'package-lock.json') -Destination $runtimeDir -Force
+
+$oldSkip = $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+try {
+    Push-Location $runtimeDir
+    npm ci --omit=dev
+    if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
+    Pop-Location
+}
+finally {
+    if ((Get-Location).Path -eq $runtimeDir) { Pop-Location }
+    $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $oldSkip
+}
+
+if (-not (Test-Path (Join-Path $runtimeDir 'node_modules\playwright'))) {
+    throw 'Playwright dependency was not prepared correctly.'
+}
+if (-not (Test-Path (Join-Path $runtimeDir 'node_modules\xlsx'))) {
+    throw 'xlsx dependency was not prepared correctly.'
+}
+
+# Build the one-file Windows application.
+py -3 -m PyInstaller --clean --noconfirm KafalaCompareApp_fixed.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+
+$exePath = Join-Path $distDir 'KafalaCompareApp.exe'
+if (-not (Test-Path $exePath)) {
+    throw "Expected EXE was not created: $exePath"
+}
+
+# Create portable ZIP from the clean output.
+$zipPath = Join-Path $PSScriptRoot 'KafalaCompareApp_build.zip'
 if (Test-Path $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
-Compress-Archive -Path ".\dist\KafalaCompareApp.exe" -DestinationPath $zipPath -Force
+Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
 
-Write-Host "EXE built at: $PSScriptRoot\dist\KafalaCompareApp.exe"
-Write-Host "Package built at: $zipPath"
+Write-Host "EXE built at: $exePath"
+Write-Host "Portable package built at: $zipPath"
 
-# Download VC++ Redistributable.
-$vcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-$vcRedistPath = ".\vc_redist.x64.exe"
+# Download VC++ Redistributable for the installer.
+$vcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+$vcRedistPath = Join-Path $PSScriptRoot 'vc_redist.x64.exe'
 if (-not (Test-Path $vcRedistPath)) {
-    Write-Host "Downloading Visual C++ Redistributable..."
+    Write-Host 'Downloading Visual C++ Redistributable...'
     Invoke-WebRequest -Uri $vcRedistUrl -OutFile $vcRedistPath -UseBasicParsing
 }
 
-# Compile Inno Setup script.
-$isccPath = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
-if (Test-Path $isccPath) {
-    Write-Host "Compiling Inno Setup script..."
-    & $isccPath ".\KafalaCompareApp.iss"
-    Write-Host "Installer created successfully."
+# Compile Inno Setup installer when the compiler is available.
+$isccCandidates = @(
+    'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+    'C:\Program Files\Inno Setup 6\ISCC.exe'
+)
+$isccPath = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($isccPath) {
+    Write-Host 'Compiling Inno Setup installer...'
+    & $isccPath '.\KafalaCompareApp.iss'
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+    Write-Host 'Installer created successfully.'
 } else {
-    Write-Host "Inno Setup compiler not found at $isccPath"
-    Write-Host "Please install Inno Setup 6 to create the installer."
+    Write-Host 'Inno Setup 6 not found; portable EXE/ZIP were still built successfully.'
 }
 
+# PyInstaller temporary build directory is safe to remove. Keep runtimeDir because
+# it can help diagnose packaging issues on the developer machine.
 if (Test-Path $buildDir) {
-    $resolvedBuildDir = (Resolve-Path $buildDir).Path
-    if (-not $resolvedBuildDir.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean outside project folder: $resolvedBuildDir"
-    }
-    Remove-Item -LiteralPath $resolvedBuildDir -Recurse -Force
-    Write-Host "Temporary build folder removed."
+    Assert-InProject $buildDir
+    Remove-Item -LiteralPath $buildDir -Recurse -Force
+    Write-Host 'Temporary PyInstaller build folder removed.'
 }
