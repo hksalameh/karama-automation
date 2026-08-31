@@ -6,10 +6,11 @@ const xlsx = require('xlsx');
 const LOGIN_URL = 'http://92.253.101.105:8040/ICCS/index.aspx';
 const DISBURSEMENT_URL_HINT = '/ICCS/Family_sub2.aspx';
 
+// هذه مهلة قصوى فقط. البرنامج لا ينتظرها إذا تحقق الشرط قبل ذلك.
 const SITE_ACTION_TIMEOUT_MS = 60000;
-const SITE_SETTLE_MS = 1200;
-const FIELD_SETTLE_MS = 250;
-const POLL_MS = 250;
+const POLL_MS = 100;
+const AFTER_ACTION_SETTLE_MS = 120;
+const FIELD_SETTLE_MS = 60;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -58,6 +59,20 @@ function progress(index, total, record, status) {
   console.log(`__PROGRESS__|${index}|${total}|${safe(record.natId)}|${safe(record.oldAmount)}|${safe(record.newAmount)}|${safe(status)}`);
 }
 
+async function waitUntil(check, description, timeoutMs = SITE_ACTION_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = '';
+  while (Date.now() < deadline) {
+    try {
+      if (await check()) return true;
+    } catch (err) {
+      lastError = err?.message || String(err);
+    }
+    await sleep(POLL_MS);
+  }
+  throw new Error(`انتهت مهلة انتظار ${description}${lastError ? `: ${lastError}` : ''}.`);
+}
+
 function readConfig() {
   const excelPath = process.env.KARAMA_EXCEL_PATH || '';
   const username = process.env.KARAMA_USERNAME || '';
@@ -69,19 +84,14 @@ function readConfig() {
   if (!excelPath || !fs.existsSync(excelPath)) {
     throw new Error(`ملف نتيجة المقارنة غير موجود: ${excelPath || '(فارغ)'}`);
   }
-  if (!username || !password) {
-    throw new Error('اسم المستخدم أو كلمة المرور غير مدخلين.');
-  }
-  if (!/^\d{4}$/.test(year)) {
-    throw new Error(`السنة غير صحيحة: ${year}`);
-  }
+  if (!username || !password) throw new Error('اسم المستخدم أو كلمة المرور غير مدخلين.');
+  if (!/^\d{4}$/.test(year)) throw new Error(`السنة غير صحيحة: ${year}`);
+
   const monthNum = Number(month);
   if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) {
     throw new Error(`الشهر غير صحيح: ${month}`);
   }
-  if (!category) {
-    throw new Error('التصنيف غير محدد.');
-  }
+  if (!category) throw new Error('التصنيف غير محدد.');
 
   return { excelPath, username, password, year, month: String(monthNum), category };
 }
@@ -134,6 +144,7 @@ async function launchBrowser() {
     ['Edge', { channel: 'msedge', ...launchOptions }],
     ['Chromium', launchOptions],
   ];
+
   const errors = [];
   for (const [name, options] of attempts) {
     try {
@@ -157,45 +168,21 @@ function isFinalSaveLabel(label) {
 }
 
 async function waitUntilEnabled(locator, description, timeoutMs = SITE_ACTION_TIMEOUT_MS) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError = '';
-  while (Date.now() < deadline) {
-    try {
-      if (await locator.isVisible().catch(() => false) && await locator.isEnabled().catch(() => false)) {
-        return;
-      }
-    } catch (err) {
-      lastError = err.message || String(err);
-    }
-    await sleep(POLL_MS);
-  }
-  throw new Error(`انتهت مهلة انتظار تفعيل ${description}${lastError ? `: ${lastError}` : ''}.`);
+  await waitUntil(async () => {
+    return await locator.isVisible().catch(() => false) && await locator.isEnabled().catch(() => false);
+  }, `تفعيل ${description}`, timeoutMs);
 }
 
-async function waitForPageReady(page, description = 'الموقع', timeoutMs = SITE_ACTION_TIMEOUT_MS) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    try {
-      const ready = await page.evaluate(() => document.readyState === 'complete' || document.readyState === 'interactive');
-      if (ready) break;
-    } catch (_) {}
-    await sleep(POLL_MS);
-  }
-
-  const remain = Math.max(1000, deadline - Date.now());
-  await page.waitForLoadState('domcontentloaded', { timeout: remain }).catch(() => {});
-  await page.waitForLoadState('networkidle', { timeout: Math.min(10000, remain) }).catch(() => {});
-  await sleep(SITE_SETTLE_MS);
-
-  if (page.isClosed()) {
-    throw new Error(`تم إغلاق الصفحة أثناء انتظار ${description}.`);
-  }
+async function bodyContains(page, wanted) {
+  const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
+  const list = Array.isArray(wanted) ? wanted : [wanted];
+  return list.some((x) => body.includes(normalizeText(x)));
 }
 
 async function safeClickAndWait(page, locator, description, {
   expectText = null,
   expectUrlPart = null,
+  expectFn = null,
   timeoutMs = SITE_ACTION_TIMEOUT_MS,
 } = {}) {
   await waitUntilEnabled(locator, description, timeoutMs);
@@ -205,74 +192,22 @@ async function safeClickAndWait(page, locator, description, {
     throw new Error(`حماية الأمان منعت الضغط على "${label}". زر الحفظ النهائي ممنوع تماماً.`);
   }
 
-  const beforeUrl = page.url();
-  log(`⏳ ${description} — انتظار استجابة موقع كرامة...`);
-
-  const navPromise = page.waitForNavigation({
-    waitUntil: 'domcontentloaded',
-    timeout: timeoutMs,
-  }).catch(() => null);
-
+  log(`⏳ ${description}...`);
   await locator.click({ timeout: timeoutMs });
-  await Promise.race([
-    navPromise,
-    sleep(Math.min(5000, timeoutMs)),
-  ]).catch(() => {});
-
-  await waitForPageReady(page, description, timeoutMs);
 
   if (expectUrlPart) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (page.url().includes(expectUrlPart)) break;
-      await sleep(POLL_MS);
-    }
-    if (!page.url().includes(expectUrlPart)) {
-      throw new Error(`بعد ${description} لم تنتقل الصفحة إلى المكان المتوقع.`);
-    }
+    await waitUntil(() => Promise.resolve(page.url().includes(expectUrlPart)), `انتقال الصفحة بعد ${description}`, timeoutMs);
   }
 
   if (expectText) {
-    const deadline = Date.now() + timeoutMs;
-    let found = false;
-    while (Date.now() < deadline) {
-      const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
-      const wanted = Array.isArray(expectText) ? expectText : [expectText];
-      if (wanted.some((t) => body.includes(normalizeText(t)))) {
-        found = true;
-        break;
-      }
-      await sleep(POLL_MS);
-    }
-    if (!found) {
-      throw new Error(`بعد ${description} لم يظهر المحتوى المتوقع في الصفحة.`);
-    }
+    await waitUntil(() => bodyContains(page, expectText), `ظهور نتيجة ${description}`, timeoutMs);
   }
 
-  if (page.url() === beforeUrl) {
-    log(`ℹ️ ${description}: الصفحة بقيت على نفس الرابط بعد انتهاء استجابة الموقع.`);
+  if (expectFn) {
+    await waitUntil(expectFn, `اكتمال ${description}`, timeoutMs);
   }
-}
 
-async function selectOptionAndWait(page, select, value, description, timeoutMs = SITE_ACTION_TIMEOUT_MS) {
-  await waitUntilEnabled(select, description, timeoutMs);
-  const beforeUrl = page.url();
-  const navPromise = page.waitForNavigation({
-    waitUntil: 'domcontentloaded',
-    timeout: timeoutMs,
-  }).catch(() => null);
-
-  await select.selectOption(value);
-  await Promise.race([
-    navPromise,
-    sleep(2500),
-  ]).catch(() => {});
-
-  if (page.url() !== beforeUrl) {
-    await waitForPageReady(page, description, timeoutMs);
-  } else {
-    await sleep(FIELD_SETTLE_MS);
-  }
+  await sleep(AFTER_ACTION_SETTLE_MS);
 }
 
 async function findClickableByText(page, wantedText, { exact = true } = {}) {
@@ -295,10 +230,9 @@ async function findClickableByText(page, wantedText, { exact = true } = {}) {
 async function login(page, config) {
   log('🌐 فتح صفحة الدخول...');
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: SITE_ACTION_TIMEOUT_MS });
-  await waitForPageReady(page, 'تحميل صفحة الدخول');
 
   const passwordInput = page.locator('input[type="password"]:visible').first();
-  if ((await passwordInput.count()) === 0) throw new Error('لم أجد حقل كلمة المرور في صفحة الدخول.');
+  await waitUntil(() => passwordInput.isVisible().catch(() => false), 'تحميل حقل كلمة المرور');
 
   const textInputs = page.locator('input[type="text"]:visible, input:not([type]):visible');
   let usernameInput = null;
@@ -351,12 +285,7 @@ async function describeSelect(select) {
   return select.evaluate((el) => {
     const opts = Array.from(el.options || []).map((o) => (o.textContent || '').trim());
     const parentText = (el.closest('tr')?.innerText || el.parentElement?.innerText || '').trim();
-    return {
-      id: el.id || '',
-      name: el.name || '',
-      options: opts,
-      parentText,
-    };
+    return { id: el.id || '', name: el.name || '', options: opts, parentText };
   }).catch(() => ({ id: '', name: '', options: [], parentText: '' }));
 }
 
@@ -380,7 +309,6 @@ async function findCategorySelect(page) {
       best = s;
     }
   }
-
   return bestScore >= 4 ? best : null;
 }
 
@@ -403,7 +331,6 @@ async function findMonthSelect(page) {
       best = s;
     }
   }
-
   return bestScore >= 8 ? best : null;
 }
 
@@ -429,8 +356,20 @@ async function findYearInput(page) {
       }
     } catch (_) {}
   }
-
   return bestScore >= 5 ? best : null;
+}
+
+async function selectedOptionMatches(select, wantedText) {
+  const wanted = normalizeText(wantedText);
+  const selected = normalizeText(await select.locator('option:checked').first().textContent().catch(() => ''));
+  return selected === wanted || selected.includes(wanted) || wanted.includes(selected);
+}
+
+async function selectOptionFast(page, select, value, wantedText, description) {
+  await waitUntilEnabled(select, description);
+  await select.selectOption(value);
+  await waitUntil(() => selectedOptionMatches(select, wantedText), `تأكيد ${description}`);
+  await sleep(FIELD_SETTLE_MS);
 }
 
 async function selectByNormalizedText(page, select, wanted, description) {
@@ -443,13 +382,61 @@ async function selectByNormalizedText(page, select, wanted, description) {
     if (text === target || text.includes(target) || target.includes(text)) {
       const value = await option.getAttribute('value');
       if (value !== null) {
-        await selectOptionAndWait(page, select, value, description);
+        await selectOptionFast(page, select, value, wanted, description);
         return true;
       }
     }
   }
-
   return false;
+}
+
+async function disbursementRowsMatchConfig(page, config) {
+  return await page.evaluate(({ year, month, category }) => {
+    const norm = (value) => String(value || '')
+      .trim()
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ى/g, 'ي')
+      .replace(/ة/g, 'ه')
+      .replace(/ـ/g, '')
+      .replace(/\s+/g, ' ');
+    const digits = (value) => String(value || '').replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[^\d]/g, '');
+
+    const wantedCategory = norm(category);
+    const tables = Array.from(document.querySelectorAll('table'));
+
+    for (const table of tables) {
+      const rows = Array.from(table.querySelectorAll('tr'));
+      let headerCells = null;
+      for (const row of rows) {
+        const cells = Array.from(row.children);
+        const texts = cells.map((c) => norm(c.innerText || c.textContent || ''));
+        if (texts.some((t) => t.includes('الرقم الوطني')) && texts.some((t) => t.includes('القيم'))) {
+          headerCells = texts;
+          break;
+        }
+      }
+      if (!headerCells) continue;
+
+      const idxNat = headerCells.findIndex((t) => t.includes('الرقم الوطني'));
+      const idxMonth = headerCells.findIndex((t) => t === 'الشهر' || t.includes('الشهر'));
+      const idxYear = headerCells.findIndex((t) => t === 'السنه' || t === 'السنة' || t.includes('السنه') || t.includes('السنة'));
+      const idxCategory = headerCells.findIndex((t) => t.includes('التصنيف'));
+
+      for (const row of rows) {
+        const cells = Array.from(row.children);
+        if (cells.length <= Math.max(idxNat, idxMonth, idxYear, idxCategory)) continue;
+        const nat = idxNat >= 0 ? digits(cells[idxNat]?.innerText || cells[idxNat]?.textContent || '') : '';
+        if (nat.length < 8) continue;
+        const m = idxMonth >= 0 ? digits(cells[idxMonth]?.innerText || cells[idxMonth]?.textContent || '') : '';
+        const y = idxYear >= 0 ? digits(cells[idxYear]?.innerText || cells[idxYear]?.textContent || '') : '';
+        const c = idxCategory >= 0 ? norm(cells[idxCategory]?.innerText || cells[idxCategory]?.textContent || '') : '';
+        if (m === String(month) && y === String(year) && (c === wantedCategory || c.includes(wantedCategory) || wantedCategory.includes(c))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, config).catch(() => false);
 }
 
 async function configureDisbursement(page, config) {
@@ -459,7 +446,6 @@ async function configureDisbursement(page, config) {
   if (!yearInput) throw new Error('لم أجد حقل السنة في شاشة الصرفية.');
   await waitUntilEnabled(yearInput, 'حقل السنة');
   await yearInput.fill(config.year);
-  await sleep(FIELD_SETTLE_MS);
 
   const monthSelect = await findMonthSelect(page);
   if (!monthSelect) throw new Error('لم أجد قائمة الشهر في شاشة الصرفية.');
@@ -471,7 +457,7 @@ async function configureDisbursement(page, config) {
     if (label === config.month) {
       const value = await option.getAttribute('value');
       if (value !== null) {
-        await selectOptionAndWait(page, monthSelect, value, `اختيار الشهر ${config.month}`);
+        await selectOptionFast(page, monthSelect, value, config.month, `اختيار الشهر ${config.month}`);
         monthSelected = true;
         break;
       }
@@ -489,13 +475,9 @@ async function configureDisbursement(page, config) {
   if (!showButton) throw new Error('لم أجد زر "عرض" في شاشة الصرفية.');
 
   await safeClickAndWait(page, showButton, 'عرض الصرفية', {
-    expectText: ['الرقم الوطني', 'القيمه', 'القيمة'],
+    expectFn: () => disbursementRowsMatchConfig(page, config),
   });
 
-  const bodyText = normalizeText(await page.locator('body').innerText().catch(() => ''));
-  if (!bodyText.includes('الرقم الوطني') || (!bodyText.includes('القيم') && !bodyText.includes('القيمة'))) {
-    throw new Error('بعد الضغط على عرض لم يظهر جدول الصرفية المتوقع.');
-  }
   log('✅ تم عرض الصرفية المطلوبة.');
 }
 
@@ -508,7 +490,6 @@ function nameLooksLikeMatch(rowText, expectedName) {
 
   const tokens = expected.split(' ').filter((x) => x.length >= 3);
   if (!tokens.length) return true;
-
   const matched = tokens.filter((token) => row.includes(token)).length;
   return matched >= Math.min(3, tokens.length);
 }
@@ -531,7 +512,6 @@ async function findRowByNatId(page, record) {
           break;
         }
       }
-
       if (!natFound) continue;
 
       const rowText = await row.textContent().catch(() => '');
@@ -543,78 +523,119 @@ async function findRowByNatId(page, record) {
       if (String(err.message || err).includes('الاسم في الصف')) throw err;
     }
   }
-
   return null;
 }
 
-async function amountColumnIndexForRow(row) {
-  return row.evaluate((tr) => {
-    const norm = (value) => String(value || '')
+async function locateAmountInputIndex(row, oldAmount) {
+  return row.evaluate((tr, expectedOld) => {
+    const normText = (value) => String(value || '')
       .trim()
       .replace(/[أإآ]/g, 'ا')
       .replace(/ى/g, 'ي')
       .replace(/ة/g, 'ه')
       .replace(/ـ/g, '')
       .replace(/\s+/g, ' ');
+    const normAmount = (value) => {
+      const s = String(value ?? '')
+        .trim()
+        .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+        .replace(/,/g, '')
+        .replace(/[^\d.-]/g, '');
+      if (!s) return '';
+      const n = Number(s);
+      return Number.isFinite(n) ? String(n) : s;
+    };
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+    };
 
-    const table = tr.closest('table');
-    if (!table) return -1;
+    const allInputs = Array.from(tr.querySelectorAll('input'));
+    const candidates = allInputs.filter((el) => {
+      const type = String(el.getAttribute('type') || 'text').toLowerCase();
+      if (/hidden|button|submit|checkbox|radio|image/.test(type)) return false;
+      if (el.disabled || el.readOnly || !visible(el)) return false;
+      return true;
+    });
 
-    const allRows = Array.from(table.querySelectorAll('tr'));
-    for (const headerRow of allRows) {
-      const cells = Array.from(headerRow.children);
-      const texts = cells.map((c) => norm(c.innerText || c.textContent || ''));
-      if (!texts.some((t) => t.includes('الرقم الوطني'))) continue;
+    if (!candidates.length) return { index: -1, reason: 'no-editable-inputs', debug: [] };
 
-      for (let i = 0; i < texts.length; i++) {
-        if (texts[i] === 'القيمه' || texts[i] === 'القيمة' || texts[i].includes('القيمه') || texts[i].includes('القيمة')) {
-          return i;
-        }
+    const debug = candidates.map((el) => ({
+      value: normAmount(el.value),
+      id: el.id || '',
+      name: el.name || '',
+      x: Math.round(el.getBoundingClientRect().left + el.getBoundingClientRect().width / 2),
+    }));
+
+    if (expectedOld !== '') {
+      const matches = candidates.filter((el) => normAmount(el.value) === expectedOld);
+      if (matches.length === 1) {
+        return { index: allInputs.indexOf(matches[0]), reason: 'old-amount-exact', debug };
       }
     }
-    return -1;
-  }).catch(() => -1);
-}
 
-async function visibleEditableInputs(locator) {
-  const inputs = locator.locator('input');
-  const count = await inputs.count();
-  const out = [];
+    const table = tr.closest('table');
+    if (!table) return { index: -1, reason: 'no-table', debug };
 
-  for (let i = 0; i < count; i++) {
-    const input = inputs.nth(i);
-    try {
-      const type = (await input.getAttribute('type')) || 'text';
-      if (/hidden|button|submit|checkbox|radio|image/i.test(type)) continue;
-      if (!(await input.isVisible()) || !(await input.isEnabled())) continue;
-      out.push(input);
-    } catch (_) {}
-  }
+    let valueHeader = null;
+    let notesHeader = null;
+    for (const headerRow of Array.from(table.querySelectorAll('tr'))) {
+      const cells = Array.from(headerRow.children);
+      const texts = cells.map((c) => normText(c.innerText || c.textContent || ''));
+      if (!texts.some((t) => t.includes('الرقم الوطني'))) continue;
+      for (let i = 0; i < cells.length; i++) {
+        const t = texts[i];
+        if (!valueHeader && (t === 'القيمه' || t === 'القيمة' || t.includes('القيمه') || t.includes('القيمة'))) valueHeader = cells[i];
+        if (!notesHeader && t.includes('ملاحظ')) notesHeader = cells[i];
+      }
+      if (valueHeader) break;
+    }
 
-  return out;
+    if (!valueHeader) return { index: -1, reason: 'value-header-not-found', debug };
+
+    const valueRect = valueHeader.getBoundingClientRect();
+    const valueX = valueRect.left + valueRect.width / 2;
+    let notesX = null;
+    if (notesHeader) {
+      const r = notesHeader.getBoundingClientRect();
+      notesX = r.left + r.width / 2;
+    }
+
+    const ranked = candidates.map((el) => {
+      const r = el.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const valueDistance = Math.abs(x - valueX);
+      const notesDistance = notesX === null ? Infinity : Math.abs(x - notesX);
+      return { el, valueDistance, notesDistance };
+    }).sort((a, b) => a.valueDistance - b.valueDistance);
+
+    const best = ranked[0];
+    if (!best) return { index: -1, reason: 'no-ranked-input', debug };
+
+    if (best.valueDistance > 180 || best.notesDistance < best.valueDistance) {
+      return { index: -1, reason: 'geometry-not-confident', debug };
+    }
+
+    return { index: allInputs.indexOf(best.el), reason: 'value-column-geometry', debug };
+  }, oldAmount).catch(() => ({ index: -1, reason: 'evaluate-failed', debug: [] }));
 }
 
 async function findAmountInput(row, record) {
-  const columnIndex = await amountColumnIndexForRow(row);
-
-  if (columnIndex >= 0) {
-    const cells = row.locator('td, th');
-    if (columnIndex < await cells.count()) {
-      const cell = cells.nth(columnIndex);
-      const candidates = await visibleEditableInputs(cell);
-      if (candidates.length === 1) return candidates[0];
+  const located = await locateAmountInputIndex(row, record.oldAmount);
+  if (located.index >= 0) {
+    const input = row.locator('input').nth(located.index);
+    if (await input.isEditable().catch(() => false)) {
+      log(`🔎 حقل القيمة ${record.natId}: ${located.reason}`);
+      return input;
     }
   }
 
-  const inputs = await visibleEditableInputs(row);
-  const oldMatches = [];
-  for (const input of inputs) {
-    const value = normalizeAmount(await input.inputValue().catch(() => ''));
-    if (value === record.oldAmount) oldMatches.push(input);
-  }
-  if (oldMatches.length === 1) return oldMatches[0];
-
-  throw new Error(`لم أستطع تحديد حقل القيمة بثقة للرقم الوطني ${record.natId}.`);
+  const details = (located.debug || []).map((x) => `${x.value || '(فارغ)'}[${x.id || x.name || 'بدون اسم'}]`).join('، ');
+  throw new Error(
+    `لم أستطع تحديد حقل القيمة بثقة للرقم الوطني ${record.natId}.` +
+    (details ? ` الحقول الموجودة في الصف: ${details}` : '')
+  );
 }
 
 async function processRecord(page, record, index, total) {
@@ -624,7 +645,7 @@ async function processRecord(page, record, index, total) {
   if (!row) throw new Error(`لم أجد الرقم الوطني ${record.natId} داخل الصرفية المعروضة.`);
 
   const input = await findAmountInput(row, record);
-  await waitUntilEnabled(input, `حقل قيمة الرقم ${record.natId}`);
+  await waitUntil(() => input.isEditable().catch(() => false), `جاهزية حقل قيمة الرقم ${record.natId}`);
 
   const current = normalizeAmount(await input.inputValue().catch(() => ''));
   const target = normalizeAmount(record.newAmount);
@@ -635,10 +656,11 @@ async function processRecord(page, record, index, total) {
   }
 
   if (record.oldAmount !== '' && current !== record.oldAmount) {
-    throw new Error(`القيمة الحالية في الموقع (${current}) لا تطابق القيمة الموجودة في ملف كرامة (${record.oldAmount}) للرقم ${record.natId}.`);
+    throw new Error(`القيمة الحالية في الحقل المكتشف (${current}) لا تطابق قيمة ملف كرامة (${record.oldAmount}) للرقم ${record.natId}.`);
   }
 
   await input.fill(target);
+  await waitUntil(async () => normalizeAmount(await input.inputValue().catch(() => '')) === target, `تأكيد تعديل الرقم ${record.natId}`, 5000);
   await sleep(FIELD_SETTLE_MS);
 
   const after = normalizeAmount(await input.inputValue().catch(() => ''));
@@ -662,7 +684,6 @@ async function clickTemporarySave(page) {
       if (!(await el.isVisible())) continue;
       const label = normalizeText(await controlLabel(el));
       if (isFinalSaveLabel(label)) continue;
-
       if (label === 'حفظ مؤقت' || (label.includes('حفظ') && label.includes('مؤقت'))) {
         tempButton = el;
         break;
@@ -671,18 +692,31 @@ async function clickTemporarySave(page) {
   }
 
   if (!tempButton) throw new Error('لم أجد زر "حفظ مؤقت". لم يتم تنفيذ أي حفظ نهائي.');
-
   const chosenLabel = normalizeText(await controlLabel(tempButton));
   if (isFinalSaveLabel(chosenLabel)) {
     throw new Error('حماية الأمان منعت الضغط لأن الزر المكتشف يحتوي على كلمة "نهائي".');
   }
 
-  await safeClickAndWait(page, tempButton, 'الحفظ المؤقت', {
-    expectText: 'تم حفظ القيم بنجاح',
-  });
+  const successText = 'تم حفظ القيم بنجاح';
+  const successWasVisibleBefore = await bodyContains(page, successText);
+  let navigated = false;
+  const navPromise = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SITE_ACTION_TIMEOUT_MS })
+    .then(() => { navigated = true; return true; })
+    .catch(() => false);
 
-  const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
-  if (!body.includes('تم حفظ القيم بنجاح')) {
+  await waitUntilEnabled(tempButton, 'زر حفظ مؤقت');
+  log('⏳ الحفظ المؤقت...');
+  await tempButton.click({ timeout: SITE_ACTION_TIMEOUT_MS });
+
+  await waitUntil(async () => {
+    if (await bodyContains(page, successText)) {
+      if (!successWasVisibleBefore || navigated) return true;
+    }
+    return false;
+  }, 'رسالة نجاح الحفظ المؤقت');
+
+  await Promise.race([navPromise, sleep(200)]).catch(() => {});
+  if (!(await bodyContains(page, successText))) {
     throw new Error('تم الضغط على حفظ مؤقت، لكن لم تظهر رسالة "تم حفظ القيم بنجاح".');
   }
 
@@ -699,7 +733,6 @@ async function readVisibleTotal(page) {
 
       const row = label.closest('tr') || label.parentElement;
       if (!row) return '';
-
       const input = row.querySelector('input');
       if (input && input.value) return input.value;
 
@@ -715,15 +748,11 @@ async function readVisibleTotal(page) {
 async function main() {
   const config = readConfig();
   const records = loadRecords(config.excelPath);
-
   if (!records.length) throw new Error('لا توجد سجلات في ورقة "يحتاج تعديل".');
 
   log(`📄 تم تحميل ${records.length} سجل يحتاج تعديل.`);
 
-  const duplicateIds = records
-    .map((r) => r.natId)
-    .filter((id, idx, arr) => arr.indexOf(id) !== idx);
-
+  const duplicateIds = records.map((r) => r.natId).filter((id, idx, arr) => arr.indexOf(id) !== idx);
   if (duplicateIds.length) {
     throw new Error(`يوجد رقم وطني مكرر في ملف التعديل: ${[...new Set(duplicateIds)].join(', ')}. تم إيقاف العملية للحماية.`);
   }
@@ -743,23 +772,18 @@ async function main() {
 
     for (let i = 0; i < records.length; i++) {
       const record = records[i];
-
       try {
         const result = await processRecord(page, record, i + 1, records.length);
         results.push(result);
       } catch (err) {
         results.push({ ...record, status: 'error', error: err.message || String(err) });
-
         const reportPath = outputPath(`auto_update_result_${Date.now()}.json`);
         fs.writeFileSync(reportPath, JSON.stringify(results, null, 2), 'utf8');
-
         throw new Error(
           `توقفت العملية عند السجل ${i + 1}/${records.length}: ${err.message || err}\n` +
           'لم يتم الضغط على حفظ مؤقت بعد هذا الخطأ.'
         );
       }
-
-      await sleep(FIELD_SETTLE_MS);
     }
 
     await clickTemporarySave(page);
@@ -767,7 +791,6 @@ async function main() {
 
     const total = await readVisibleTotal(page);
     const reportPath = outputPath(`auto_update_result_${Date.now()}.json`);
-
     fs.writeFileSync(reportPath, JSON.stringify({
       year: config.year,
       month: config.month,
@@ -781,12 +804,9 @@ async function main() {
     log('🛑 انتهت مسؤولية البرنامج هنا. لن يتم الضغط على "حفظ نهائي" بأي شكل.');
     log('👀 المتصفح سيبقى مفتوحاً لتراجع المجموع ثم تقوم أنت بالحفظ النهائي يدوياً إذا كان صحيحاً.');
 
-    while (browser.isConnected()) {
-      await sleep(1000);
-    }
+    while (browser.isConnected()) await sleep(1000);
   } catch (err) {
     const reportPath = outputPath(`auto_update_error_${Date.now()}.json`);
-
     fs.writeFileSync(reportPath, JSON.stringify({
       year: config.year,
       month: config.month,
@@ -795,7 +815,6 @@ async function main() {
       error: err.message || String(err),
       results,
     }, null, 2), 'utf8');
-
     throw err;
   }
 }
