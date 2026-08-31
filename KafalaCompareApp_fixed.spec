@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['kafala_compare_app.py'],
+    ['kafala_compare_app_v2.py'],
     pathex=[],
     datas=[
         ('auto_update_gui.py', '.'),
