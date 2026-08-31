@@ -1,0 +1,17 @@
+{
+  "name": "karama-automation",
+  "version": "1.0.0",
+  "description": "",
+  "main": "auto_update_from_diff.js",
+  "scripts": {
+    "start": "node auto_update_from_diff.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.60.0",
+    "xlsx": "^0.18.5"
+  }
+}
