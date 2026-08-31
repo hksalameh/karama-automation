@@ -61,8 +61,8 @@ if (-not (Test-Path (Join-Path $runtimeDir 'node_modules\xlsx'))) {
     throw 'xlsx dependency was not prepared correctly.'
 }
 
-# Build the one-file Windows application.
-py -3 -m PyInstaller --clean --noconfirm KafalaCompareApp_fixed.spec
+# Build the one-file Windows application using the active Python from PATH.
+python -m PyInstaller --clean --noconfirm KafalaCompareApp_fixed.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
 $exePath = Join-Path $distDir 'KafalaCompareApp.exe'
