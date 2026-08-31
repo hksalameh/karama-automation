@@ -11,7 +11,7 @@ a = Analysis(
         ('KafalaCompareApp_build/node.exe', '.'),
         ('KafalaCompareApp_build/node_modules', 'node_modules')
     ],
-    hiddenimports=['openpyxl', 'tkinter.scrolledtext'],
+    hiddenimports=['openpyxl', 'xlrd', 'tkinter.scrolledtext'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
