@@ -1,7 +1,11 @@
 from decimal import Decimal
 import pandas as pd
 
-from kafala_compare_app_v2 import build_review_candidates
+from kafala_compare_app_v2 import (
+    build_review_candidates,
+    detail_total_including_duplicates,
+    find_printed_total_in_raw,
+)
 
 
 def row_site(nat, name, amount='24'):
@@ -42,4 +46,23 @@ review, s_ids, r_ids = build_review_candidates(site, ref)
 assert len(review) == 2
 assert review['الحالة'].str.contains('مكرر').all()
 
-print('matching safety tests passed')
+# يجب تجاهل مجموع الصفحة واختيار المجموع الإجمالي المطبوع.
+raw = pd.DataFrame([
+    ['', 'مجموع الصفحة', '412', ''],
+    ['', '', '', ''],
+    ['', 'المجموع الإجمالي', '7633.3', ''],
+])
+assert find_printed_total_in_raw(raw) == Decimal('7633.3')
+
+# مجموع التفاصيل يجب أن يشمل الصفوف المكررة كلها، لا أول سجل فقط.
+ref_unique = pd.DataFrame([
+    row_ref('1', 'أ', '10'),
+    row_ref('2', 'ب', '20'),
+])
+ref_dup = pd.DataFrame([
+    row_ref('2', 'ب', '20'),
+    row_ref('2', 'ب', '4'),
+])
+assert detail_total_including_duplicates(ref_unique, ref_dup) == Decimal('34')
+
+print('matching and total safety tests passed')
