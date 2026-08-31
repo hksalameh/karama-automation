@@ -1,8 +1,12 @@
+import base64
+import ctypes
+import json
 import os
 import sys
 import subprocess
 import threading
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import ttk, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
@@ -24,14 +28,70 @@ def writable_app_dir():
     return path
 
 
+class DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ('cbData', wintypes.DWORD),
+        ('pbData', ctypes.POINTER(ctypes.c_byte)),
+    ]
+
+
+def _dpapi_protect(text):
+    """Encrypt text for the current Windows user using DPAPI."""
+    if os.name != 'nt':
+        raise RuntimeError('حفظ كلمة المرور الآمن متاح على Windows فقط.')
+
+    raw = text.encode('utf-8')
+    in_buffer = ctypes.create_string_buffer(raw)
+    in_blob = DATA_BLOB(len(raw), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = DATA_BLOB()
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    if not crypt32.CryptProtectData(
+        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+    ):
+        raise ctypes.WinError()
+
+    try:
+        encrypted = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        return base64.b64encode(encrypted).decode('ascii')
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+def _dpapi_unprotect(encoded):
+    """Decrypt text previously protected for the current Windows user."""
+    if os.name != 'nt':
+        return ''
+
+    encrypted = base64.b64decode(encoded.encode('ascii'))
+    in_buffer = ctypes.create_string_buffer(encrypted)
+    in_blob = DATA_BLOB(len(encrypted), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = DATA_BLOB()
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+    ):
+        raise ctypes.WinError()
+
+    try:
+        raw = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        return raw.decode('utf-8')
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
 class AutoUpdateGUI:
-    """واجهة المرحلة الثانية: الدخول إلى كرامة والتعديل ثم الحفظ المؤقت فقط."""
+    """واجهة الدخول إلى كرامة والتعديل ثم الحفظ المؤقت فقط."""
 
     def __init__(self, parent_frame, excel_path, options):
         self.root = parent_frame
         self.excel_path = excel_path
         self.options = options or {}
         self.runtime_dir = writable_app_dir()
+        self.credentials_path = os.path.join(self.runtime_dir, 'karama_credentials.json')
         self.process = None
         self.reader_thread = None
         self.running = False
@@ -42,6 +102,7 @@ class AutoUpdateGUI:
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
         self.show_password_var = tk.BooleanVar(value=False)
+        self.remember_credentials_var = tk.BooleanVar(value=True)
         self.year_var = tk.StringVar(value=str(now.year))
         self.month_var = tk.StringVar(value=str(now.month))
         self.category_var = tk.StringVar(value='ايتام')
@@ -52,8 +113,57 @@ class AutoUpdateGUI:
         self.current_status_var = tk.StringVar(value='جاهز')
         self.total_var = tk.StringVar(value='---')
 
+        self._load_saved_credentials()
         self._build_ui()
         self._validate_excel_exists()
+
+    def _load_saved_credentials(self):
+        if not os.path.isfile(self.credentials_path):
+            return
+        try:
+            with open(self.credentials_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            username = str(data.get('username', '')).strip()
+            encrypted = str(data.get('password_dpapi', '')).strip()
+            password = _dpapi_unprotect(encrypted) if encrypted else ''
+            if username and password:
+                self.username_var.set(username)
+                self.password_var.set(password)
+                self.remember_credentials_var.set(True)
+        except Exception:
+            # لا نمنع تشغيل البرنامج إذا تلف ملف الإعدادات أو تغير مستخدم Windows.
+            self.username_var.set('')
+            self.password_var.set('')
+
+    def _save_credentials(self, username, password):
+        if not self.remember_credentials_var.get():
+            self._delete_saved_credentials()
+            return
+        data = {
+            'version': 1,
+            'username': username,
+            'password_dpapi': _dpapi_protect(password),
+        }
+        temp_path = self.credentials_path + '.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, self.credentials_path)
+
+    def _delete_saved_credentials(self):
+        try:
+            if os.path.exists(self.credentials_path):
+                os.remove(self.credentials_path)
+        except Exception:
+            pass
+
+    def _clear_saved_credentials(self):
+        if self.running:
+            return
+        self._delete_saved_credentials()
+        self.username_var.set('')
+        self.password_var.set('')
+        self.remember_credentials_var.set(True)
+        messagebox.showinfo('تم', 'تم مسح بيانات دخول كرامة المحفوظة من هذا الجهاز.')
 
     def _build_ui(self):
         self.root.configure(bg='#e5e7eb')
@@ -65,15 +175,12 @@ class AutoUpdateGUI:
             header,
             text='التعديل التلقائي في موقع كرامة',
             font=('Tahoma', 16, 'bold'),
-            fg='white',
-            bg='#2f4358'
+            fg='white', bg='#2f4358'
         ).pack(pady=(12, 3))
         tk.Label(
             header,
             text='التعديل الآلي ينتهي عند الحفظ المؤقت فقط — الحفظ النهائي يبقى يدوياً',
-            font=('Tahoma', 10),
-            fg='#dbeafe',
-            bg='#2f4358'
+            font=('Tahoma', 10), fg='#dbeafe', bg='#2f4358'
         ).pack()
 
         content = tk.Frame(self.root, bg='#e5e7eb')
@@ -81,8 +188,7 @@ class AutoUpdateGUI:
 
         settings = tk.LabelFrame(
             content, text='إعدادات التشغيل',
-            font=('Tahoma', 11, 'bold'),
-            fg='#2f4358', bg='white', padx=10, pady=8
+            font=('Tahoma', 11, 'bold'), fg='#2f4358', bg='white', padx=10, pady=8
         )
         settings.pack(fill=tk.X, pady=(0, 8))
 
@@ -97,10 +203,11 @@ class AutoUpdateGUI:
         tk.Label(settings, text='كلمة المرور:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=1, column=3, sticky='e', padx=5, pady=4)
         self.password_entry = tk.Entry(settings, textvariable=self.password_var, justify='right', show='●', width=24, font=('Tahoma', 10))
         self.password_entry.grid(row=1, column=2, sticky='ew', padx=5, pady=4)
-        tk.Checkbutton(
+        self.show_password_check = tk.Checkbutton(
             settings, text='إظهار', variable=self.show_password_var,
             command=self._toggle_password, bg='white', font=('Tahoma', 9)
-        ).grid(row=1, column=1, sticky='w', padx=5)
+        )
+        self.show_password_check.grid(row=1, column=1, sticky='w', padx=5)
 
         tk.Label(settings, text='السنة:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=2, column=5, sticky='e', padx=5, pady=4)
         self.year_entry = tk.Entry(settings, textvariable=self.year_var, justify='center', width=10, font=('Tahoma', 10))
@@ -112,21 +219,31 @@ class AutoUpdateGUI:
 
         tk.Label(settings, text='التصنيف:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=2, column=1, sticky='e', padx=5, pady=4)
         self.category_combo = ttk.Combobox(
-            settings,
-            textvariable=self.category_var,
-            values=['ايتام', 'اسر', 'طلاب علم'],
-            width=14,
-            state='readonly',
-            justify='center'
+            settings, textvariable=self.category_var,
+            values=['ايتام', 'اسر', 'طلاب علم'], width=14,
+            state='readonly', justify='center'
         )
         self.category_combo.grid(row=2, column=0, sticky='w', padx=5, pady=4)
 
-        note = tk.Label(
-            settings,
-            text='بيانات الدخول تُستخدم لهذه الجلسة فقط ولا يتم حفظ كلمة المرور داخل ملفات البرنامج.',
-            bg='white', fg='#64748b', font=('Tahoma', 9), anchor='e', justify='right'
+        credential_row = tk.Frame(settings, bg='white')
+        credential_row.grid(row=3, column=0, columnspan=6, sticky='ew', padx=5, pady=(5, 0))
+        self.remember_check = tk.Checkbutton(
+            credential_row,
+            text='حفظ بيانات الدخول على هذا الجهاز',
+            variable=self.remember_credentials_var,
+            bg='white', font=('Tahoma', 9)
         )
-        note.grid(row=3, column=0, columnspan=6, sticky='e', padx=5, pady=(5, 0))
+        self.remember_check.pack(side=tk.RIGHT)
+        self.clear_credentials_btn = tk.Button(
+            credential_row, text='مسح المحفوظ', command=self._clear_saved_credentials,
+            font=('Tahoma', 8), padx=8, pady=1
+        )
+        self.clear_credentials_btn.pack(side=tk.RIGHT, padx=8)
+        tk.Label(
+            credential_row,
+            text='كلمة المرور تُحفظ مشفّرة بحماية Windows ولا تُخزن كنص عادي.',
+            bg='white', fg='#64748b', font=('Tahoma', 9)
+        ).pack(side=tk.RIGHT, padx=8)
 
         for col in range(6):
             settings.grid_columnconfigure(col, weight=1 if col in (0, 2, 4) else 0)
@@ -199,6 +316,8 @@ class AutoUpdateGUI:
             self._log(f'ملف المقارنة غير موجود: {self.excel_path}', 'ERROR')
         else:
             self._log(f'جاهز. ملف المقارنة: {self.excel_path}', 'INFO')
+            if self.username_var.get() and self.password_var.get():
+                self._log('تم تحميل بيانات دخول كرامة المحفوظة على هذا الجهاز.', 'INFO')
 
     def _toggle_password(self):
         self.password_entry.config(show='' if self.show_password_var.get() else '●')
@@ -223,8 +342,7 @@ class AutoUpdateGUI:
             bundled = os.path.join(base_dir, 'KafalaCompareApp_build', 'node.exe')
             if os.path.isfile(bundled):
                 return bundled
-        system_node = which('node')
-        return system_node
+        return which('node')
 
     def _set_controls_running(self, running):
         self.running = running
@@ -233,6 +351,9 @@ class AutoUpdateGUI:
         self.username_entry.config(state=state)
         self.password_entry.config(state=state)
         self.year_entry.config(state=state)
+        self.show_password_check.config(state=state)
+        self.remember_check.config(state=state)
+        self.clear_credentials_btn.config(state=state)
         self.month_combo.config(state='disabled' if running else 'readonly')
         self.category_combo.config(state='disabled' if running else 'readonly')
         self.cancel_btn.config(state=tk.NORMAL if running else tk.DISABLED)
@@ -259,6 +380,13 @@ class AutoUpdateGUI:
         if category not in ('ايتام', 'اسر', 'طلاب علم'):
             messagebox.showerror('بيانات غير صحيحة', 'اختر التصنيف الصحيح.')
             return
+
+        try:
+            self._save_credentials(username, password)
+        except Exception as exc:
+            if self.remember_credentials_var.get():
+                messagebox.showerror('تعذر حفظ بيانات الدخول', f'لم أستطع حفظ بيانات الدخول بأمان:\n{exc}')
+                return
 
         if not messagebox.askyesno(
             'تأكيد بدء التشغيل',
