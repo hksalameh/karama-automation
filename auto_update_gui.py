@@ -1,34 +1,23 @@
-﻿import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import json
 import os
 import sys
+import subprocess
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
-import subprocess
-import ctypes
-from ctypes import wintypes
-import threading
-import time
-import openpyxl
-from openpyxl.utils import get_column_letter
-from decimal import Decimal
+from shutil import which
+
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        # Not in a PyInstaller bundle
         base_path = os.path.abspath(os.path.dirname(__file__))
-        if os.path.basename(base_path).lower() == '__pycache__':
-            base_path = os.path.abspath(os.path.join(base_path, os.pardir))
     return os.path.join(base_path, relative_path)
 
 
 def writable_app_dir():
-    """Return a per-user directory that stays writable after installation."""
     base_dir = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA') or os.path.expanduser('~')
     path = os.path.join(base_dir, 'KafalaCompareApp')
     os.makedirs(path, exist_ok=True)
@@ -36,814 +25,418 @@ def writable_app_dir():
 
 
 class AutoUpdateGUI:
+    """واجهة المرحلة الثانية: الدخول إلى كرامة والتعديل ثم الحفظ المؤقت فقط."""
+
     def __init__(self, parent_frame, excel_path, options):
-        self.root = parent_frame  # هو Frame وليس Toplevel
+        self.root = parent_frame
         self.excel_path = excel_path
-        self.options = options
-        self.current_idx = 0
-        self.records = []
-        self.results = []
-        self.paused = True
-        self.stop_requested = False
-        self.browser_process = None
-        self.browser_started = False
-        self.processing_started = False  # هل بدأت المعالجة الفعلية (بعد تسجيل الدخول)
-        self.browser_ready = False
-        self.completed = False  # هل اكتملت العملية
-        self.records_loaded = False
-        self.build_dir = None
+        self.options = options or {}
         self.runtime_dir = writable_app_dir()
-        self._pre_browser_windows = set()
-        
-        # شروط التعديل (Checkbox variables)
-        self.confirm_var = tk.BooleanVar(value=False)   # تأكيد يدوي
-        self.save_var = tk.BooleanVar(value=False)     # تفعيل الحفظ المؤقت
-        self.allow_zero_var = tk.BooleanVar(value=True) # السماح بالتصفير
-        
-        self.setup_ui()
-        self.start_update_process()
-    
-    def setup_ui(self):
-        """إعداد واجهة المستخدم"""
-        self.root.configure(bg='#f3f4f6')
-        
-        # شريط العنوان
-        header = tk.Frame(self.root, bg='#2f4358', height=80)
-        header.pack(fill=tk.X, padx=0, pady=0)
+        self.process = None
+        self.reader_thread = None
+        self.running = False
+        self.completed_temp_save = False
+        self.stop_requested = False
+
+        now = datetime.now()
+        self.username_var = tk.StringVar()
+        self.password_var = tk.StringVar()
+        self.show_password_var = tk.BooleanVar(value=False)
+        self.year_var = tk.StringVar(value=str(now.year))
+        self.month_var = tk.StringVar(value=str(now.month))
+        self.category_var = tk.StringVar(value='ايتام')
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.current_nat_var = tk.StringVar(value='---')
+        self.current_change_var = tk.StringVar(value='---')
+        self.current_status_var = tk.StringVar(value='جاهز')
+        self.total_var = tk.StringVar(value='---')
+
+        self._build_ui()
+        self._validate_excel_exists()
+
+    def _build_ui(self):
+        self.root.configure(bg='#e5e7eb')
+
+        header = tk.Frame(self.root, bg='#2f4358', height=82)
+        header.pack(fill=tk.X)
         header.pack_propagate(False)
-        
-        title = tk.Label(header, text='نافذة مراقبة التعديل التلقائي', 
-                        font=('Tahoma', 16, 'bold'), fg='white', bg='#2f4358')
-        title.pack(pady=10)
-        
-        # معلومات الملف
-        file_info = tk.Label(header, text=f'الملف: {Path(self.excel_path).name}', 
-                            font=('Tahoma', 10), fg='#ddd', bg='#2f4358')
-        file_info.pack()
-        
-        # شريط التقدم
-        progress_frame = tk.Frame(self.root, bg='#f3f4f6')
-        progress_frame.pack(fill=tk.X, padx=15, pady=10)
-        
-        self.progress_label = tk.Label(progress_frame, text='جاري التحضير...', 
-                                       font=('Tahoma', 10), fg='#111827')
-        self.progress_label.pack(anchor='w')
-        
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', 
-                                            length=400, maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=5)
-        
-        # إطار الشروط
-        cond_frame = tk.LabelFrame(self.root, text='خيارات التعديل', font=('Tahoma', 10, 'bold'), fg='#2f4358', bg='white', padx=10, pady=8)
-        cond_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.confirm_check = tk.Checkbutton(cond_frame, text='تأكيد يدوي قبل كل تعديل', variable=self.confirm_var, bg='white', anchor='e', font=('Tahoma', 10))
-        self.confirm_check.pack(anchor='w', padx=5, pady=2)
-        self.save_check = tk.Checkbutton(cond_frame, text='تفعيل الحفظ المؤقت بعد كل 15 تعديل', variable=self.save_var, bg='white', anchor='e', font=('Tahoma', 10))
-        self.save_check.pack(anchor='w', padx=5, pady=2)
-        self.allow_zero_check = tk.Checkbutton(cond_frame, text='السماح بتعديل المبلغ الى 0', variable=self.allow_zero_var, bg='white', anchor='e', font=('Tahoma', 10))
-        self.allow_zero_check.pack(anchor='w', padx=5, pady=2)
-        
-        # حالة المتصفح
-        browser_frame = tk.LabelFrame(self.root, text='حالة الموقع', 
-                                      font=('Tahoma', 11, 'bold'), 
-                                      fg='#2f4358', bg='white')
-        browser_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.browser_status_label = tk.Label(browser_frame, text='المتصفح لم يبدأ بعد', 
-                                           font=('Tahoma', 10), fg='#111827', bg='white')
-        self.browser_status_label.pack(anchor='w', padx=10, pady=5)
-        
-        self.open_browser_btn = tk.Button(browser_frame, text='جاري التحضير...', 
-                                         command=self.start_browser_automation,
-                                         bg='#2563eb', fg='white', 
-                                         font=('Tahoma', 10, 'bold'),
-                                         padx=18, pady=8, cursor='hand2',
-                                         state=tk.DISABLED)
-        self.open_browser_btn.pack(anchor='w', padx=10, pady=5)
-        
-        # المحتوى الرئيسي
-        main_frame = tk.Frame(self.root, bg='white')
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # البطاقة الرئيسية (الحالة الحالية)
-        self.card_frame = tk.LabelFrame(main_frame, text='الحالة الحالية', 
-                                        font=('Tahoma', 11, 'bold'), 
-                                        fg='#2f4358', bg='white')
-        self.card_frame.pack(fill=tk.X, pady=10)
-        
-        # معلومات الحالة
-        info_frame = tk.Frame(self.card_frame, bg='#f9fafb')
-        info_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        # الرقم الوطني والاسم
-        top_info = tk.Frame(info_frame, bg='#f9fafb')
-        top_info.pack(fill=tk.X, pady=5)
-        
-        tk.Label(top_info, text='الرقم الوطني:', font=('Tahoma', 10, 'bold'), 
-                fg='#2f4358', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        self.nat_id_label = tk.Label(top_info, text='---', font=('Tahoma', 10), 
-                                     fg='#111827', bg='#f9fafb')
-        self.nat_id_label.pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(top_info, text='|', fg='#ddd', bg='#f9fafb').pack(side=tk.LEFT, padx=3)
-        
-        tk.Label(top_info, text='الاسم:', font=('Tahoma', 10, 'bold'), 
-                fg='#2f4358', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        self.name_label = tk.Label(top_info, text='---', font=('Tahoma', 10), 
-                                   fg='#111827', bg='#f9fafb')
-        self.name_label.pack(side=tk.LEFT, padx=5)
-        
-        # المبالغ
-        amount_frame = tk.Frame(info_frame, bg='#f9fafb')
-        amount_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(amount_frame, text='المبلغ الحالي:', font=('Tahoma', 10, 'bold'), 
-                fg='#2f4358', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        self.old_amount_label = tk.Label(amount_frame, text='---', 
-                                        font=('Tahoma', 10, 'bold'), 
-                                        fg='#dc2626', bg='#f9fafb')
-        self.old_amount_label.pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(amount_frame, text='→', font=('Tahoma', 12, 'bold'), 
-                fg='#9ca3af', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(amount_frame, text='المبلغ الجديد:', font=('Tahoma', 10, 'bold'), 
-                fg='#2f4358', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        self.new_amount_label = tk.Label(amount_frame, text='---', 
-                                        font=('Tahoma', 10, 'bold'), 
-                                        fg='#16a34a', bg='#f9fafb')
-        self.new_amount_label.pack(side=tk.LEFT, padx=5)
-        
-        # السبب
-        reason_frame = tk.Frame(info_frame, bg='#f9fafb')
-        reason_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(reason_frame, text='السبب:', font=('Tahoma', 10, 'bold'), 
-                fg='#2f4358', bg='#f9fafb').pack(side=tk.LEFT, padx=5)
-        self.reason_label = tk.Label(reason_frame, text='---', font=('Tahoma', 9), 
-                                     fg='#6b7280', bg='#f9fafb', wraplength=500, justify=tk.LEFT)
-        self.reason_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # الأزرار الرئيسية
-        button_frame = tk.Frame(self.card_frame, bg='white')
-        button_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        on_back = self.options.get('on_back')
-        on_exit = self.options.get('on_exit')
+        tk.Label(
+            header,
+            text='التعديل التلقائي في موقع كرامة',
+            font=('Tahoma', 16, 'bold'),
+            fg='white',
+            bg='#2f4358'
+        ).pack(pady=(12, 3))
+        tk.Label(
+            header,
+            text='التعديل الآلي ينتهي عند الحفظ المؤقت فقط — الحفظ النهائي يبقى يدوياً',
+            font=('Tahoma', 10),
+            fg='#dbeafe',
+            bg='#2f4358'
+        ).pack()
 
-        tk.Button(button_frame, text='↩ العودة للرئيسية', command=on_back if on_back else self.root.destroy, bg='#3b82f6', fg='white', font=('Tahoma', 10, 'bold'), padx=16, pady=8).pack(side=tk.LEFT, padx=5)
-        
-        self.approve_btn = tk.Button(button_frame, text='✓ موافق', 
-                                     command=self.approve_update,
-                                     bg='#16a34a', fg='white', 
-                                     font=('Tahoma', 10, 'bold'),
-                                     padx=20, pady=8, cursor='hand2',
-                                     state=tk.DISABLED)
-        self.approve_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.skip_btn = tk.Button(button_frame, text='⊘ تخطي', 
-                                 command=self.skip_update,
-                                 bg='#f59e0b', fg='white', 
-                                 font=('Tahoma', 10, 'bold'),
-                                 padx=20, pady=8, cursor='hand2',
-                                 state=tk.DISABLED)
-        self.skip_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.cancel_btn = tk.Button(button_frame, text='⛔ إلغاء الكل', 
-                                   command=self.cancel_all,
-                                   bg='#dc2626', fg='white', 
-                                   font=('Tahoma', 10, 'bold'),
-                                   padx=20, pady=8, cursor='hand2')
-        self.cancel_btn.pack(side=tk.LEFT, padx=5)
+        content = tk.Frame(self.root, bg='#e5e7eb')
+        content.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
 
-        tk.Button(button_frame, text='✕ خروج', command=on_exit if on_exit else self.root.destroy, bg='#ef4444', fg='white', font=('Tahoma', 10, 'bold'), padx=16, pady=8).pack(side=tk.RIGHT, padx=5)
-        
-        # سجل التعديلات
-        log_frame = tk.LabelFrame(main_frame, text='سجل العمليات', 
-                                 font=('Tahoma', 11, 'bold'), 
-                                 fg='#2f4358', bg='white')
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, 
-                                                 font=('Courier', 9),
-                                                 bg='#f3f4f6', fg='#111827',
-                                                 wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        settings = tk.LabelFrame(
+            content, text='إعدادات التشغيل',
+            font=('Tahoma', 11, 'bold'),
+            fg='#2f4358', bg='white', padx=10, pady=8
+        )
+        settings.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(settings, text='ملف المقارنة:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=0, column=5, sticky='e', padx=5, pady=4)
+        self.file_label = tk.Label(settings, text=Path(self.excel_path).name, bg='white', fg='#334155', anchor='e', font=('Tahoma', 10))
+        self.file_label.grid(row=0, column=0, columnspan=5, sticky='ew', padx=5, pady=4)
+
+        tk.Label(settings, text='اسم المستخدم:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=1, column=5, sticky='e', padx=5, pady=4)
+        self.username_entry = tk.Entry(settings, textvariable=self.username_var, justify='right', width=24, font=('Tahoma', 10))
+        self.username_entry.grid(row=1, column=4, sticky='ew', padx=5, pady=4)
+
+        tk.Label(settings, text='كلمة المرور:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=1, column=3, sticky='e', padx=5, pady=4)
+        self.password_entry = tk.Entry(settings, textvariable=self.password_var, justify='right', show='●', width=24, font=('Tahoma', 10))
+        self.password_entry.grid(row=1, column=2, sticky='ew', padx=5, pady=4)
+        tk.Checkbutton(
+            settings, text='إظهار', variable=self.show_password_var,
+            command=self._toggle_password, bg='white', font=('Tahoma', 9)
+        ).grid(row=1, column=1, sticky='w', padx=5)
+
+        tk.Label(settings, text='السنة:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=2, column=5, sticky='e', padx=5, pady=4)
+        self.year_entry = tk.Entry(settings, textvariable=self.year_var, justify='center', width=10, font=('Tahoma', 10))
+        self.year_entry.grid(row=2, column=4, sticky='w', padx=5, pady=4)
+
+        tk.Label(settings, text='الشهر:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=2, column=3, sticky='e', padx=5, pady=4)
+        self.month_combo = ttk.Combobox(settings, textvariable=self.month_var, values=[str(i) for i in range(1, 13)], width=8, state='readonly', justify='center')
+        self.month_combo.grid(row=2, column=2, sticky='w', padx=5, pady=4)
+
+        tk.Label(settings, text='التصنيف:', bg='white', font=('Tahoma', 10, 'bold')).grid(row=2, column=1, sticky='e', padx=5, pady=4)
+        self.category_combo = ttk.Combobox(
+            settings,
+            textvariable=self.category_var,
+            values=['ايتام', 'اسر', 'طلاب علم'],
+            width=14,
+            state='readonly',
+            justify='center'
+        )
+        self.category_combo.grid(row=2, column=0, sticky='w', padx=5, pady=4)
+
+        note = tk.Label(
+            settings,
+            text='بيانات الدخول تُستخدم لهذه الجلسة فقط ولا يتم حفظ كلمة المرور داخل ملفات البرنامج.',
+            bg='white', fg='#64748b', font=('Tahoma', 9), anchor='e', justify='right'
+        )
+        note.grid(row=3, column=0, columnspan=6, sticky='e', padx=5, pady=(5, 0))
+
+        for col in range(6):
+            settings.grid_columnconfigure(col, weight=1 if col in (0, 2, 4) else 0)
+
+        actions = tk.Frame(content, bg='#e5e7eb')
+        actions.pack(fill=tk.X, pady=5)
+
+        self.start_btn = tk.Button(
+            actions, text='بدء التعديل التلقائي', command=self.start_automation,
+            bg='#2f4358', fg='white', activebackground='#24374a', activeforeground='white',
+            font=('Tahoma', 11, 'bold'), padx=20, pady=9
+        )
+        self.start_btn.pack(side=tk.LEFT, padx=4)
+
+        self.cancel_btn = tk.Button(
+            actions, text='إلغاء التشغيل', command=self.cancel_automation,
+            bg='#dc2626', fg='white', activebackground='#b91c1c', activeforeground='white',
+            font=('Tahoma', 10, 'bold'), padx=16, pady=9, state=tk.DISABLED
+        )
+        self.cancel_btn.pack(side=tk.LEFT, padx=4)
+
+        self.back_btn = tk.Button(
+            actions, text='العودة للرئيسية', command=self.go_back,
+            bg='#5f7ea0', fg='white', activebackground='#4d6b8d', activeforeground='white',
+            font=('Tahoma', 10, 'bold'), padx=16, pady=9
+        )
+        self.back_btn.pack(side=tk.RIGHT, padx=4)
+
+        progress_box = tk.LabelFrame(
+            content, text='حالة التنفيذ',
+            font=('Tahoma', 11, 'bold'), fg='#2f4358', bg='white', padx=10, pady=8
+        )
+        progress_box.pack(fill=tk.X, pady=8)
+
+        self.progress_bar = ttk.Progressbar(progress_box, variable=self.progress_var, maximum=100, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, pady=(2, 8))
+
+        row = tk.Frame(progress_box, bg='white')
+        row.pack(fill=tk.X)
+        tk.Label(row, text='الرقم الوطني:', bg='white', fg='#2f4358', font=('Tahoma', 10, 'bold')).pack(side=tk.RIGHT, padx=5)
+        tk.Label(row, textvariable=self.current_nat_var, bg='white', fg='#111827', font=('Tahoma', 10)).pack(side=tk.RIGHT, padx=5)
+        tk.Label(row, text='التعديل:', bg='white', fg='#2f4358', font=('Tahoma', 10, 'bold')).pack(side=tk.RIGHT, padx=(25, 5))
+        tk.Label(row, textvariable=self.current_change_var, bg='white', fg='#111827', font=('Tahoma', 10)).pack(side=tk.RIGHT, padx=5)
+
+        row2 = tk.Frame(progress_box, bg='white')
+        row2.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(row2, text='الحالة:', bg='white', fg='#2f4358', font=('Tahoma', 10, 'bold')).pack(side=tk.RIGHT, padx=5)
+        self.status_label = tk.Label(row2, textvariable=self.current_status_var, bg='white', fg='#111827', font=('Tahoma', 10), anchor='e')
+        self.status_label.pack(side=tk.RIGHT, padx=5)
+        tk.Label(row2, text='المجموع بعد الحفظ المؤقت:', bg='white', fg='#2f4358', font=('Tahoma', 10, 'bold')).pack(side=tk.LEFT, padx=(5, 2))
+        tk.Label(row2, textvariable=self.total_var, bg='white', fg='#16a34a', font=('Tahoma', 11, 'bold')).pack(side=tk.LEFT, padx=5)
+
+        log_box = tk.LabelFrame(
+            content, text='سجل العملية',
+            font=('Tahoma', 11, 'bold'), fg='#2f4358', bg='white', padx=6, pady=6
+        )
+        log_box.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_box, height=12, wrap=tk.WORD,
+            font=('Tahoma', 9), bg='#f8fafc', fg='#111827'
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.config(state=tk.DISABLED)
-        
-        # شريط الحالة السفلي
-        status_frame = tk.Frame(self.root, bg='#e5e7eb', height=30)
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        status_frame.pack_propagate(False)
-        
-        self.status_label = tk.Label(status_frame, text='جاري التحضير...', 
-                                    font=('Tahoma', 9), fg='#4b5563', bg='#e5e7eb')
-        self.status_label.pack(side=tk.LEFT, padx=10, pady=5)
 
-    
-    def add_log(self, message, level='INFO'):
-        """إضافة رسالة إلى السجل"""
-        if threading.current_thread() != threading.main_thread():
-            self.root.after(0, lambda: self.add_log(message, level))
+    def _validate_excel_exists(self):
+        if not self.excel_path or not os.path.exists(self.excel_path):
+            self.current_status_var.set('ملف المقارنة غير موجود')
+            self.start_btn.config(state=tk.DISABLED)
+            self._log(f'ملف المقارنة غير موجود: {self.excel_path}', 'ERROR')
+        else:
+            self._log(f'جاهز. ملف المقارنة: {self.excel_path}', 'INFO')
+
+    def _toggle_password(self):
+        self.password_entry.config(show='' if self.show_password_var.get() else '●')
+
+    def _log(self, message, level='INFO'):
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda: self._log(message, level))
             return
-
         timestamp = datetime.now().strftime('%H:%M:%S')
-        colors_map = {
-            'INFO': '#111827',
-            'SUCCESS': '#16a34a',
-            'WARNING': '#f59e0b',
-            'ERROR': '#dc2626',
-        }
-        
         self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f'[{timestamp}] {message}\n', level)
-        self.log_text.tag_config('INFO', foreground=colors_map.get(level, '#111827'))
-        self.log_text.tag_config('SUCCESS', foreground=colors_map.get('SUCCESS'))
-        self.log_text.tag_config('WARNING', foreground=colors_map.get('WARNING'))
-        self.log_text.tag_config('ERROR', foreground=colors_map.get('ERROR'))
+        self.log_text.insert(tk.END, f'[{timestamp}] {message}\n')
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
-        self.root.update_idletasks()
-    
-    def start_update_process(self):
-        """بدء عملية التحديث في thread منفصل"""
-        thread = threading.Thread(target=self.run_update, daemon=True)
-        thread.start()
 
-    def update_browser_status(self, text, level='INFO'):
-        if threading.current_thread() != threading.main_thread():
-            self.root.after(0, lambda: self.update_browser_status(text, level))
+    def _find_node(self):
+        if getattr(sys, 'frozen', False):
+            bundled = resource_path('node.exe')
+            if os.path.isfile(bundled):
+                return bundled
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            bundled = os.path.join(base_dir, 'KafalaCompareApp_build', 'node.exe')
+            if os.path.isfile(bundled):
+                return bundled
+        system_node = which('node')
+        return system_node
+
+    def _set_controls_running(self, running):
+        self.running = running
+        state = tk.DISABLED if running else tk.NORMAL
+        self.start_btn.config(state=state)
+        self.username_entry.config(state=state)
+        self.password_entry.config(state=state)
+        self.year_entry.config(state=state)
+        self.month_combo.config(state='disabled' if running else 'readonly')
+        self.category_combo.config(state='disabled' if running else 'readonly')
+        self.cancel_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+
+    def start_automation(self):
+        if self.running:
             return
-        self.browser_status_label.config(text=text)
-        self.add_log(text, level)
-    
-    def run_update(self):
-        """تشغيل سكربت التحديث"""
-        try:
-            self.root.after(0, lambda: self.open_browser_btn.config(state=tk.DISABLED, text='جاري التحضير...'))
-            self.add_log('جاري التحضير للتحديث...', 'INFO')
-            self.add_log(f'الملف: {self.excel_path}', 'INFO')
-            
-            # قراءة البيانات من Excel
-            self.load_records_from_excel()
-            self.records_loaded = True
-            self.add_log(f'✓ تم تجهيز {len(self.records)} سجل للتعديل', 'SUCCESS')
-            
-            if not self.records:
-                self.add_log('لم يتم العثور على أي سجلات قابلة للتعديل في ملف النتيجة', 'WARNING')
-                self.root.after(0, self._show_no_records_ready)
-                return
-            
-            time.sleep(1)
-            # لا تعرض السجل الأول الآن، انتظر حتى يضغط المستخدم على "بدء المعالجة"
-            self.root.after(0, lambda: self.update_initial_state())
-        except Exception as e:
-            self.add_log(f'خطأ: {str(e)}', 'ERROR')
-            self.root.after(0, self._show_no_records_ready)
-    
-    def update_initial_state(self):
-        if not self.records:
-            self._show_no_records_ready()
+
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        year = self.year_var.get().strip()
+        month = self.month_var.get().strip()
+        category = self.category_var.get().strip()
+
+        if not username or not password:
+            messagebox.showerror('بيانات ناقصة', 'أدخل اسم المستخدم وكلمة المرور لموقع كرامة.')
             return
-        self.update_browser_status('اضغط زر "فتح الموقع" لبدء المتصفح.', 'INFO')
-        self.open_browser_btn.config(state=tk.NORMAL, text='فتح الموقع', command=self.start_browser_automation)
-        self.status_label.config(text=f'جاهز للبدء. تم العثور على {len(self.records)} سجل.')
+        if len(year) != 4 or not year.isdigit():
+            messagebox.showerror('بيانات غير صحيحة', 'أدخل السنة بأربعة أرقام.')
+            return
+        if not month.isdigit() or not 1 <= int(month) <= 12:
+            messagebox.showerror('بيانات غير صحيحة', 'اختر الشهر الصحيح.')
+            return
+        if category not in ('ايتام', 'اسر', 'طلاب علم'):
+            messagebox.showerror('بيانات غير صحيحة', 'اختر التصنيف الصحيح.')
+            return
 
-    def _show_no_records_ready(self):
-        self.update_browser_status('لا توجد سجلات قابلة للتعديل في ملف النتيجة.', 'WARNING')
-        self.open_browser_btn.config(state=tk.NORMAL, text='فتح الموقع', command=self.start_browser_automation)
-        self.status_label.config(text='لا توجد سجلات قابلة للتعديل. راجع ورقة "يحتاج تعديل".')
+        if not messagebox.askyesno(
+            'تأكيد بدء التشغيل',
+            f'سيتم العمل على:\nالسنة: {year}\nالشهر: {month}\nالتصنيف: {category}\n\n'
+            'سيتم الضغط على "حفظ مؤقت" فقط بعد نجاح جميع التعديلات.\n'
+            'لن يتم الضغط على "حفظ نهائي".\n\nهل تريد البدء؟'
+        ):
+            return
 
-    def load_records_from_excel(self):
-        """قراءة البيانات من ملف Excel"""
+        node_path = self._find_node()
+        script_path = resource_path('auto_update_from_diff.js')
+        if not node_path:
+            messagebox.showerror('خطأ', 'تعذر العثور على Node.js المطلوب لتشغيل الأتمتة.')
+            return
+        if not os.path.exists(script_path):
+            messagebox.showerror('خطأ', f'سكربت الأتمتة غير موجود:\n{script_path}')
+            return
+
+        env = os.environ.copy()
+        env['KARAMA_EXCEL_PATH'] = self.excel_path
+        env['KARAMA_USERNAME'] = username
+        env['KARAMA_PASSWORD'] = password
+        env['KARAMA_YEAR'] = year
+        env['KARAMA_MONTH'] = month
+        env['KARAMA_CATEGORY'] = category
+        env['KARAMA_OUTPUT_DIR'] = self.runtime_dir
+
+        self.completed_temp_save = False
+        self.stop_requested = False
+        self.progress_var.set(0)
+        self.total_var.set('---')
+        self.current_nat_var.set('---')
+        self.current_change_var.set('---')
+        self.current_status_var.set('جاري تشغيل المتصفح...')
+        self._set_controls_running(True)
+        self._log(f'بدء التشغيل: {year}/{month} - {category}', 'INFO')
+
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         try:
-            wb = openpyxl.load_workbook(self.excel_path, data_only=True)
-            sheet_name = '\u064a\u062d\u062a\u0627\u062c \u062a\u0639\u062f\u064a\u0644'  # يحتاج تعديل
-            
-            if sheet_name not in wb.sheetnames:
-                # جرب الأسماء المختلفة الممكنة
-                for sn in wb.sheetnames:
-                    if 'تعديل' in sn or 'حتاج' in sn:
-                        sheet_name = sn
-                        break
-            
-            if sheet_name not in wb.sheetnames:
-                raise ValueError(f'لم يتم العثور على ورقة العمل "يحتاج تعديل" - الأوراق المتاحة: {wb.sheetnames}')
-            
-            ws = wb[sheet_name]
-            
-            # تجاوز الصفوف الفارغة في البداية
-            data_start_row = 1
-            for row_idx in range(1, ws.max_row + 1):
-                if ws[f'A{row_idx}'].value:
-                    data_start_row = row_idx
-                    break
-            
-            # قراءة رؤوس الأعمدة (الصف الأول)
-            header_row = data_start_row
-            nat_id_col = None
-            name_col = None
-            old_amount_col = None
-            new_amount_col = None
-            reason_col = None
-            
-            for col_idx in range(1, ws.max_column + 1):
-                header = ws.cell(header_row, col_idx).value
-                if header:
-                    header_str = str(header).strip()
-                    if 'وطني' in header_str or 'natId' in header_str.lower():
-                        nat_id_col = col_idx
-                    elif 'اسم' in header_str and 'الموقع' in header_str:
-                        name_col = col_idx
-                    elif 'مبلغ' in header_str and 'الموقع' in header_str:
-                        old_amount_col = col_idx
-                    elif 'مبلغ' in header_str and 'فعلي' in header_str:
-                        new_amount_col = col_idx
-                    elif 'سبب' in header_str:
-                        reason_col = col_idx
-            
-            # إذا لم نجد أسماء العمود، استخدم الفهارس الافتراضية
-            if not nat_id_col:
-                nat_id_col = 1
-            if not name_col:
-                name_col = 2
-            if not old_amount_col:
-                old_amount_col = 4
-            if not new_amount_col:
-                new_amount_col = 5
-            if not reason_col:
-                reason_col = 6
-            
-            # قراءة البيانات
-            self.records = []
-            for row_idx in range(header_row + 1, ws.max_row + 1):
-                nat_id_cell = ws.cell(row_idx, nat_id_col)
-                name_cell = ws.cell(row_idx, name_col)
-                old_amount_cell = ws.cell(row_idx, old_amount_col)
-                new_amount_cell = ws.cell(row_idx, new_amount_col)
-                reason_cell = ws.cell(row_idx, reason_col)
-                
-                nat_id = nat_id_cell.value
-                name = name_cell.value
-                old_amount = old_amount_cell.value
-                new_amount = new_amount_cell.value
-                reason = reason_cell.value
-                
-                if nat_id and (old_amount or new_amount):
-                    self.records.append({
-                        'natId': str(nat_id).strip(),
-                        'name': str(name).strip() if name else '---',
-                        'oldAmount': str(old_amount).strip() if old_amount else '',
-                        'newAmount': str(new_amount).strip() if new_amount else '',
-                        'reason': str(reason).strip() if reason else '',
-                    })
-            
-            wb.close()
-        except Exception as e:
-            self.add_log(f'خطأ في قراءة الملف: {str(e)}', 'ERROR')
-            raise
-    
-    def start_browser_automation(self):
-        """بدء سكربت Playwright في thread منفصل"""
-        try:
-            if not self.records_loaded:
-                messagebox.showwarning('تنبيه', 'ما زال التطبيق يقرأ ملف النتيجة. انتظر لحظات ثم أعد المحاولة.')
-                return
-            if not self.records:
-                self.add_log('⚠️  لا توجد سجلات قابلة للتعديل في ملف النتيجة، سيتم فتح الموقع فقط.', 'WARNING')
-
-            if self.browser_started:
-                self.add_log('المتصفح قيد التشغيل بالفعل.', 'WARNING')
-                return
-
-            # Reset end-of-run state so the same session can be started again.
-            self.completed = False
-            self.stop_requested = False
-            self.processing_started = False
-            self.current_idx = 0
-
-            if getattr(sys, 'frozen', False):
-                # The application is frozen (e.g., by PyInstaller)
-                base_dir = os.path.dirname(sys.executable)
-            else:
-                # The application is running as a script
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-
-            script_path = resource_path('auto_update_from_diff.js')
-            
-            if not os.path.exists(script_path):
-                raise FileNotFoundError(f'سكربت التحديث غير موجود: {script_path}')
-            
-            # إنشاء ملف مؤقت للبيانات للتواصل بين GUI و Node.js.
-            # Program Files is read-only for normal users, so keep runtime
-            # files in the user's local app data directory.
-            self.runtime_dir = writable_app_dir()
-            self.control_file = os.path.join(self.runtime_dir, f'_control_{int(time.time())}.json')
-            
-            # تمرير مسار Excel عن طريق متغير البيئة (ملف مؤقت يحتوي على المسار)
-            env = os.environ.copy()
-            self.path_file = os.path.join(self.runtime_dir, f'_karama_path_{int(time.time())}.txt')
-            with open(self.path_file, 'w', encoding='utf-8') as f:
-                f.write(self.excel_path)
-            env['KARAMA_PATH_FILE'] = self.path_file
-            env['KARAMA_CONTROL_FILE'] = self.control_file
-            env['KARAMA_OUTPUT_DIR'] = self.runtime_dir
-            
-            # بناء أوامر سطر الأوامر
-            # In frozen mode, node.exe is at _MEIPASS root (per fixed.spec layout)
-            # In script mode, it's in the KafalaCompareApp_build folder
-            if getattr(sys, 'frozen', False):
-                node_path_bundled = resource_path('node.exe')
-                self.build_dir = resource_path('.')
-            else:
-                node_path_bundled = os.path.join(base_dir, 'KafalaCompareApp_build', 'node.exe')
-                self.build_dir = os.path.join(base_dir, 'KafalaCompareApp_build')
-
-            node_candidates = [
-                node_path_bundled, # First, check for the bundled version
-                'node', # Fallback to system PATH
-            ]
-            node_path = None
-            for candidate in node_candidates:
-                if self._find_executable(candidate):
-                    node_path = candidate
-                    break
-            if not node_path:
-                raise FileNotFoundError('تعذر العثور على node.exe أو node في PATH. تأكد من تثبيت Node.js.')
-            
-            cmd = [node_path, script_path, '--from-gui']
-            # قراءة الشروط من واجهة المستخدم
-            # The GUI itself controls manual approval before sending each record.
-            # Keep the Node side non-interactive so it processes exactly the
-            # command the GUI already approved.
-            cmd.append('--yes')
-            if self.allow_zero_var.get():
-                cmd.append('--allow-zero')
-            if self.save_var.get():
-                cmd.append('--save')
-            
-            self.add_log(f'cmd: {cmd}', 'INFO')
-            self.update_browser_status('جاري تشغيل المتصفح...', 'INFO')
-            self.open_browser_btn.config(state=tk.DISABLED)
-            
-            # التقاط النوافذ الموجودة قبل تشغيل المتصفح
-            self._capture_existing_browser_windows()
-
-            # تشغيل السكربت في thread
-            self.browser_thread = threading.Thread(
-                target=self._run_browser_process,
-                args=(cmd, env),
-                daemon=True
-            )
-            self.browser_thread.start()
-            self.add_log('✓ جاري بدء عملية المتصفح...', 'SUCCESS')
-
-            # تعطيل الخيارات بعد بدء التشغيل
-            self.confirm_check.config(state=tk.DISABLED)
-            self.save_check.config(state=tk.DISABLED)
-            self.allow_zero_check.config(state=tk.DISABLED)
-            self.add_log('🔒 تم تثبيت خيارات التعديل. لا يمكن تغييرها الآن.', 'INFO')
-        except Exception as e:
-            self.open_browser_btn.config(state=tk.NORMAL)
-            self.update_browser_status(f'خطأ في فتح المتصفح: {str(e)}', 'ERROR')
-            raise
-    
-    def _find_executable(self, candidate):
-        """التحقق من وجود ملف تنفيذي محلي أو على PATH."""
-        from shutil import which
-
-        if not candidate:
-            return False
-
-        # If the caller already gave us an absolute path, use it directly.
-        if os.path.isabs(candidate):
-            return os.path.isfile(candidate)
-
-        # Otherwise fall back to PATH lookup.
-        return which(candidate) is not None
-    
-    def _run_browser_process(self, cmd, env):
-        """تشغيل عملية المتصفح"""
-        try:
-            self.browser_process = subprocess.Popen(
-                cmd,
-                env=env, cwd=self.runtime_dir, creationflags=subprocess.CREATE_NO_WINDOW,
+            self.process = subprocess.Popen(
+                [node_path, script_path],
+                cwd=self.runtime_dir,
+                env=env,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                creationflags=creationflags,
             )
-            self.root.after(0, self._on_browser_started)
-
-            # قراءة stdout والكشف عن إشارة الإكمال
-            if self.browser_process.stdout:
-                for line in self.browser_process.stdout:
-                    s = line.strip()
-                    if '__DONE__' in s:
-                        self.add_log('DONE signal detected', 'SUCCESS')
-                        self.root.after(0, lambda: self._on_browser_finished(0))
-                        break
-                    if s:
-                        self.add_log(s, 'INFO')
-            if self.browser_process.stderr:
-                for line in self.browser_process.stderr:
-                    s = line.strip()
-                    if s:
-                        self.add_log(s, 'ERROR')
-
-            return_code = self.browser_process.wait()
-            self.root.after(0, lambda: self._on_browser_finished(return_code))
-        except Exception as e:
-            self.root.after(0, lambda: self._on_browser_failed(str(e)))
-
-    def _on_browser_started(self):
-        self.browser_started = True
-        # بعد نجاح فتح المتصفح، اجعل الزر ينتقل دائمًا إلى "بدء المعالجة".
-        if not self.records:
-            self.update_browser_status('✓ تم فتح المتصفح. لا توجد سجلات قابلة للتعديل، لذلك سيبقى البدء معطلاً عند الضغط.', 'WARNING')
-            self.open_browser_btn.config(
-                text='🚀 بدء المعالجة',
-                command=self._send_start_signal,
-                state=tk.NORMAL
-            )
-            self.status_label.config(text='المتصفح مفتوح، لكن لا توجد سجلات قابلة للتعديل.')
-            self._position_main_window_right()
-            self.root.after(2000, self._try_position_browser_left, 0)
+        except Exception as exc:
+            self._set_controls_running(False)
+            messagebox.showerror('خطأ', f'تعذر تشغيل الأتمتة:\n{exc}')
             return
 
-        self.update_browser_status('✓ تم فتح المتصفح. سجل الدخول ثم اضغط "بدء المعالجة".', 'SUCCESS')
-        self.open_browser_btn.config(
-            text='🚀 بدء المعالجة',
-            command=self._send_start_signal,
-            state=tk.NORMAL
+        self.reader_thread = threading.Thread(target=self._read_process_output, daemon=True)
+        self.reader_thread.start()
+
+    def _read_process_output(self):
+        try:
+            if not self.process or not self.process.stdout:
+                return
+            for raw_line in self.process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith('__PROGRESS__|'):
+                    self._handle_progress_marker(line)
+                elif line.startswith('__TEMP_SAVE_OK__|'):
+                    self._handle_temp_save_ok(line)
+                elif line.startswith('__FATAL__|'):
+                    message = line.split('|', 1)[1] if '|' in line else line
+                    self.root.after(0, lambda m=message: self._handle_fatal(m))
+                else:
+                    self._log(line, 'INFO')
+            return_code = self.process.wait()
+            self.root.after(0, lambda rc=return_code: self._process_finished(rc))
+        except Exception as exc:
+            self.root.after(0, lambda: self._handle_fatal(str(exc)))
+
+    def _handle_progress_marker(self, line):
+        parts = line.split('|', 6)
+        if len(parts) < 7:
+            return
+        _, index, total, nat_id, old_amount, new_amount, status = parts
+        try:
+            idx = int(index)
+            total_num = int(total)
+            percent = (idx / total_num) * 100 if total_num else 0
+        except Exception:
+            percent = 0
+        self.root.after(0, lambda: self._update_progress(percent, nat_id, old_amount, new_amount, status, index, total))
+
+    def _update_progress(self, percent, nat_id, old_amount, new_amount, status, index, total):
+        self.progress_var.set(percent)
+        self.current_nat_var.set(nat_id or '---')
+        self.current_change_var.set(f'{old_amount or "فارغ"} ← {new_amount or "فارغ"}')
+        self.current_status_var.set(f'[{index}/{total}] {status}')
+
+    def _handle_temp_save_ok(self, line):
+        parts = line.split('|', 2)
+        total = parts[1] if len(parts) > 1 else ''
+        report_path = parts[2] if len(parts) > 2 else ''
+        self.root.after(0, lambda: self._mark_temp_save_success(total, report_path))
+
+    def _mark_temp_save_success(self, total, report_path):
+        self.completed_temp_save = True
+        self.progress_var.set(100)
+        self.total_var.set(total or 'غير متاح')
+        self.current_status_var.set('تم الحفظ المؤقت بنجاح — راجع المجموع ثم احفظ نهائياً يدوياً')
+        self.cancel_btn.config(text='إغلاق جلسة المتصفح')
+        self._log('✅ تم الحفظ المؤقت بنجاح.', 'SUCCESS')
+        if total:
+            self._log(f'المجموع الظاهر في الموقع بعد الحفظ المؤقت: {total}', 'INFO')
+        if report_path:
+            self._log(f'تقرير التشغيل: {report_path}', 'INFO')
+        self._log('🛑 لم ولن يتم الضغط على زر حفظ نهائي.', 'WARNING')
+        messagebox.showinfo(
+            'تم الحفظ المؤقت',
+            'انتهت التعديلات وتم الحفظ المؤقت بنجاح.\n\n'
+            f'المجموع الظاهر: {total or "غير متاح"}\n\n'
+            'اترك المتصفح مفتوحاً، راجع المجموع، ثم نفّذ الحفظ النهائي بنفسك إذا كان صحيحاً.'
         )
-        self.status_label.config(text='في انتظار إشارة البدء بعد تسجيل الدخول...')
 
-        # تقسيم الشاشة: البرنامج يميناً والمتصفح يساراً
-        self._position_main_window_right()
-        self.root.after(2000, self._try_position_browser_left, 0)
+    def _handle_fatal(self, message):
+        self.current_status_var.set('توقفت العملية بسبب خطأ')
+        self._log(f'❌ {message}', 'ERROR')
+        if not self.completed_temp_save:
+            messagebox.showerror(
+                'تم إيقاف العملية للحماية',
+                f'{message}\n\nلم يتم تنفيذ الحفظ النهائي بواسطة البرنامج.'
+            )
 
-    def _send_start_signal(self):
-        if self.processing_started:
+    def _process_finished(self, return_code):
+        self._set_controls_running(False)
+        self.cancel_btn.config(text='إلغاء التشغيل')
+        if self.stop_requested:
+            self.current_status_var.set('تم إلغاء التشغيل')
             return
-        if not self.records:
-            messagebox.showwarning('تنبيه', 'لا توجد سجلات قابلة للتعديل.')
-            self._show_no_records_ready()
-            return
-        self.processing_started = True
-        self.send_command_to_browser({'action': 'start'})
-        self.add_log('إشارة البدء أُرسلت، في انتظار أول سجل...', 'INFO')
-        self.open_browser_btn.config(state=tk.DISABLED)
-        # Now show the first record and enable approve/skip
-        self.root.after(100, self.show_next_record)
-
-    def _on_browser_finished(self, return_code):
-        if self.completed:
+        if self.completed_temp_save:
+            self.current_status_var.set('انتهت الجلسة. الحفظ النهائي بقي يدوياً.')
             return
         if return_code == 0:
-            self.add_log('✅ انتهت عملية المتصفح بنجاح.', 'SUCCESS')
+            self.current_status_var.set('انتهت العملية')
         else:
-            self.add_log(f'⚠️ انتهت عملية المتصفح برمز: {return_code}', 'ERROR')
-        self.open_browser_btn.config(state=tk.DISABLED)
-        self.browser_started = False
-        self.processing_started = False
-        self.stop_requested = True
-        self.finish_update()
+            self.current_status_var.set(f'انتهت العملية برمز خطأ {return_code}')
 
-    def _on_browser_failed(self, error_message):
-        self.update_browser_status(f'فشل المتصفح: {error_message}', 'ERROR')
-        self.open_browser_btn.config(state=tk.NORMAL, text='فتح الموقع', command=self.start_browser_automation)
-        self.browser_started = False
-        self.processing_started = False
-        if not self.stop_requested:
-            self.finish_update()
-
-    def show_next_record(self):
-        """عرض الحالة التالية"""
-        if self.stop_requested or self.current_idx >= len(self.records):
-            if not self.completed:
-                self.finish_update()
+    def cancel_automation(self):
+        if not self.process or self.process.poll() is not None:
             return
 
-        record = self.records[self.current_idx]
-
-        self.nat_id_label.config(text=record['natId'])
-        self.name_label.config(text=record['name'])
-        self.old_amount_label.config(text=record['oldAmount'] or '(فارغ)')
-        self.new_amount_label.config(text=record['newAmount'])
-        self.reason_label.config(text=record['reason'])
-
-        progress = ((self.current_idx) / len(self.records)) * 100
-        self.progress_bar['value'] = progress
-
-        self.status_label.config(text=f'[{self.current_idx + 1}/{len(self.records)}] {record["natId"]}')
-
-        # إذا لم يكن التأكيد اليدوي مفعلاً، قم بالمعالجة تلقائياً بعد فترة قصيرة
-        if not self.confirm_var.get():
-            self.add_log(f'➤ [تلقائي] {record["natId"]} - {record["name"]}', 'INFO')
-            self.root.after(500, self.approve_update)
-        else:
-            # إذا كان التأكيد مفعلاً، انتظر تفاعل المستخدم
-            self.approve_btn.config(state=tk.NORMAL)
-            self.skip_btn.config(state=tk.NORMAL)
-            self.add_log(f'➤ [{self.current_idx + 1}/{len(self.records)}] {record["natId"]} - {record["name"]}', 'INFO')
-            self.add_log(f'  التعديل المطلوب: {record["oldAmount"] or "فارغ"} → {record["newAmount"]}', 'INFO')
-
-    def approve_update(self):
-        if not self.browser_started or not self.processing_started:
-            messagebox.showwarning('خطأ', 'يجب بدء المعالجة أولاً.')
-            return
-
-        record = self.records[self.current_idx]
-        self.add_log(f'أمر معالجة أُرسل لـ: {record["natId"]}', 'SUCCESS')
-        
-        command = {
-            'action': 'process',
-            'record': record,
-            'index': self.current_idx,
-            'total': len(self.records),
-        }
-        self.send_command_to_browser(command)
-        
-        self.results.append({'natId': record['natId'], 'status': 'approved_for_processing'})
-        self.approve_btn.config(state=tk.DISABLED)
-        self.skip_btn.config(state=tk.DISABLED)
-        self.status_label.config(text=f'جاري التعديل في الموقع لـ {record["natId"]}...')
-        
-        self.current_idx += 1
-        # Use a small delay to allow the backend to process before showing the next item
-        self.root.after(500, self.show_next_record)
-
-    def skip_update(self):
-        """تخطي التعديل"""
-        if not self.browser_started or not self.processing_started:
-            messagebox.showinfo('تنبيه', 'يجب بدء المعالجة أولاً بالضغط على "موافق".')
-            return
-
-        record = self.records[self.current_idx]
-        self.add_log(f'⊘ تم التخطي: {record["natId"]}', 'WARNING')
-        self.results.append({'natId': record['natId'], 'status': 'skipped'})
-        
-        # Send skip command to backend so it knows to expect the next record
-        self.send_command_to_browser({
-            'action': 'skip',
-            'record': record
-        })
-        
-        self.approve_btn.config(state=tk.DISABLED)
-        self.skip_btn.config(state=tk.DISABLED)
-        
-        self.current_idx += 1
-        self.root.after(100, self.show_next_record) # Short delay before showing next
-
-    def send_command_to_browser(self, command):
-        """إرسال أمر كامل إلى سكربت المتصفح عن طريق ملف JSON"""
-        try:
-            # Add a timestamp to the command
-            command['timestamp'] = int(time.time())
-            
-            if not hasattr(self, 'control_file'):
-                self.add_log('⚠️  ملف التحكم غير جاهز.', 'ERROR')
+        if self.completed_temp_save:
+            if not messagebox.askyesno('إغلاق المتصفح', 'هل تريد إغلاق جلسة المتصفح الآن؟'):
                 return
-            
-            with open(self.control_file, 'w', encoding='utf-8') as f:
-                json.dump(command, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.add_log(f'خطأ في إرسال الأمر: {str(e)}', 'ERROR')
-    
-    def cancel_all(self):
-        """إلغاء جميع العمليات"""
-        if messagebox.askyesno('تأكيد الإلغاء', 'هل تريد إلغاء جميع التعديلات؟'):
-            self.stop_requested = True
-            if self.browser_process and self.browser_process.poll() is None:
-                self.send_command_to_browser({'action': 'shutdown'})
-            self.add_log('⛔ تم إلغاء العملية', 'ERROR')
-            self.finish_update()
-    
-    def finish_update(self):
-        """إنهاء العملية - البقاء في نفس الشاشة"""
-        if self.completed:
-            return
-        self.completed = True
-        
-        self.approve_btn.config(state=tk.DISABLED, text='✓ تم الانتهاء')
-        self.skip_btn.config(state=tk.DISABLED)
-        self.open_browser_btn.config(state=tk.NORMAL, text='فتح الموقع', command=self.start_browser_automation)
-        
-        # # حفظ النتائج - تم التعطيل لتجنب إنشاء ملف مضلل
-        # result_file = f'auto_update_result_{int(time.time())}.json'
-        # with open(result_file, 'w', encoding='utf-8') as f:
-        #     json.dump(self.results, f, ensure_ascii=False, indent=2)
-        
-        # تحديث الحالة في نفس الشاشة
-        self.status_label.config(
-            text=f'✅ تم الانتهاء!'
-        )
-        self.progress_label.config(text='🔔 اضغط حفظ مؤقت في الموقع لحفظ التعديلات')
-        self.progress_bar['value'] = 100
-        
-        self.add_log(f'✅ انتهت العملية.', 'SUCCESS')
-        self.add_log(f'📊 تم إنشاء تقرير مفصل في: {self.runtime_dir}', 'INFO')
-        self.add_log('🔔 تذكر: اضغط حفظ مؤقت في الموقع لحفظ آخر التعديلات!', 'WARNING')
-
-        # إعادة تفعيل الخيارات لجولة جديدة
-        self.confirm_check.config(state=tk.NORMAL)
-        self.save_check.config(state=tk.NORMAL)
-        self.allow_zero_check.config(state=tk.NORMAL)
-
-
-    def _capture_existing_browser_windows(self):
-        """"Capture the set of existing Chrome browser windows before launching."""
-        try:
-            user32 = ctypes.windll.user32
-            self._pre_browser_windows = set()
-            def enum_cb(hwnd, lparam):
-                if user32.IsWindowVisible(hwnd):
-                    cls = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, cls, 256)
-                    if cls.value == 'Chrome_WidgetWin_1':
-                        self._pre_browser_windows.add(hwnd)
-                return True
-            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-            user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-        except Exception as e:
-            self.add_log(f'Window capture warning: {e}', 'WARNING')
-
-    def _position_main_window_right(self):
-        """"Position the main app window on the right half of the screen."""
-        try:
-            user32 = ctypes.windll.user32
-            screen_w = user32.GetSystemMetrics(0)
-            screen_h = user32.GetSystemMetrics(1)
-            main_root = self.root.winfo_toplevel()
-            hwnd = int(main_root.winfo_id())
-            half_w = screen_w // 2
-            margin = 8
-            user32.ShowWindow(hwnd, 1)
-            user32.MoveWindow(hwnd, half_w + margin, margin, half_w - 2 * margin, screen_h - 2 * margin, True)
-        except Exception as e:
-            self.add_log(f'Window position warning: {e}', 'WARNING')
-
-    def _try_position_browser_left(self, attempt):
-        """"Try to find and position the browser window on the left half."""
-        if attempt >= 10:
-            return
-        hwnd = self._find_new_browser_window()
-        if hwnd:
-            try:
-                user32 = ctypes.windll.user32
-                screen_w = user32.GetSystemMetrics(0)
-                screen_h = user32.GetSystemMetrics(1)
-                half_w = screen_w // 2
-                margin = 8
-                user32.ShowWindow(hwnd, 1)
-                user32.MoveWindow(hwnd, margin, margin, half_w - 2 * margin, screen_h - 2 * margin, True)
-            except Exception as e:
-                self.add_log(f'Browser position warning: {e}', 'WARNING')
         else:
-            self.root.after(800, self._try_position_browser_left, attempt + 1)
+            if not messagebox.askyesno(
+                'تأكيد الإلغاء',
+                'هل تريد إيقاف العملية الآن؟\nأي تعديلات لم يتم حفظها مؤقتاً ستُترك بدون حفظ.'
+            ):
+                return
 
-    def _find_new_browser_window(self):
-        """"Find a Chrome browser window that wasn't present before launch."""
+        self.stop_requested = True
         try:
-            user32 = ctypes.windll.user32
-            found = []
-            def enum_cb(hwnd, lparam):
-                if user32.IsWindowVisible(hwnd):
-                    cls = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, cls, 256)
-                    if cls.value == 'Chrome_WidgetWin_1':
-                        title = ctypes.create_unicode_buffer(512)
-                        user32.GetWindowTextW(hwnd, title, 512)
-                        rect = wintypes.RECT()
-                        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                        area = (rect.right - rect.left) * (rect.bottom - rect.top)
-                        if area > 20000 and hwnd not in self._pre_browser_windows:
-                            found.append((hwnd, area, title.value))
-                return True
-            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-            user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-            if found:
-                found.sort(key=lambda x: -x[1])
-                return found[0][0]
-            return None
+            self.process.terminate()
         except Exception:
-            return None
+            pass
+        self._log('تم طلب إيقاف جلسة الأتمتة.', 'WARNING')
 
+    def go_back(self):
+        if self.running and not self.completed_temp_save:
+            messagebox.showwarning('العملية تعمل', 'ألغِ التشغيل أولاً قبل العودة للرئيسية.')
+            return
 
-def main():
-    root = tk.Tk()
-    
-    # مثال على الاستخدام
-    excel_path = 'result.xlsx'
-    options = {'confirm': True, 'save': False, 'allow_zero': False}
-    
-    app = AutoUpdateGUI(root, excel_path, options)
-    root.mainloop()
-
-
-if __name__ == '__main__':
-    main()
+        on_back = self.options.get('on_back')
+        if self.completed_temp_save and self.process and self.process.poll() is None:
+            self._log('العودة للرئيسية مع إبقاء المتصفح مفتوحاً للمراجعة.', 'INFO')
+        if on_back:
+            on_back()
+        else:
+            self.root.destroy()
