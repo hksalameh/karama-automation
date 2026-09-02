@@ -55,6 +55,8 @@ jobs:
           python -m py_compile kafala_compare_app.py kafala_compare_app_v2.py auto_update_gui.py patch_auto_update_js.py
           python test_matching_logic.py
           node --check auto_update_from_diff.js
+          if (-not (Select-String -Path '.\auto_update_from_diff.js' -Pattern 'YEAR_FIELD_ROBUST_V3' -Quiet)) { throw 'Year-field patch missing' }
+          if (-not (Select-String -Path '.\auto_update_from_diff.js' -Pattern 'DISBURSEMENT_READY_V1' -Quiet)) { throw 'Disbursement readiness patch missing' }
 
       - name: Install Inno Setup
         shell: pwsh
