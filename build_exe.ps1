@@ -1,6 +1,10 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
+# Apply idempotent browser-script fixes before validation/build.
+python .\patch_auto_update_js.py
+if ($LASTEXITCODE -ne 0) { throw "patch_auto_update_js.py failed with exit code $LASTEXITCODE" }
+
 $distDir = Join-Path $PSScriptRoot 'dist'
 $buildDir = Join-Path $PSScriptRoot 'build'
 $runtimeDir = Join-Path $PSScriptRoot 'KafalaCompareApp_build'
@@ -36,6 +40,9 @@ if (-not $nodeCommand) {
 if (-not $nodeCommand) {
     throw 'Node.js was not found. Install Node.js 22 or run the GitHub Actions build workflow.'
 }
+
+& $nodeCommand.Source --check (Join-Path $PSScriptRoot 'auto_update_from_diff.js')
+if ($LASTEXITCODE -ne 0) { throw "Patched auto_update_from_diff.js failed syntax validation" }
 
 Copy-Item -LiteralPath $nodeCommand.Source -Destination (Join-Path $runtimeDir 'node.exe') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'package.json') -Destination $runtimeDir -Force
