@@ -11,6 +11,7 @@ on:
       - 'test_matching_logic.py'
       - 'auto_update_gui.py'
       - 'auto_update_from_diff.js'
+      - 'patch_auto_update_js.py'
       - 'KafalaCompareApp_fixed.spec'
       - 'KafalaCompareApp.iss'
       - 'build_exe.ps1'
@@ -44,10 +45,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller pandas openpyxl xlrd
 
+      - name: Apply browser compatibility fixes
+        shell: pwsh
+        run: python patch_auto_update_js.py
+
       - name: Validate matching and automation code
         shell: pwsh
         run: |
-          python -m py_compile kafala_compare_app.py kafala_compare_app_v2.py auto_update_gui.py
+          python -m py_compile kafala_compare_app.py kafala_compare_app_v2.py auto_update_gui.py patch_auto_update_js.py
           python test_matching_logic.py
           node --check auto_update_from_diff.js
 
