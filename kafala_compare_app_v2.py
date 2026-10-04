@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 import kafala_compare_app as base
-from auto_update_gui import show_review_cases
+from auto_update_gui import show_review_cases, show_review_history
 
 
 TOTAL_TOLERANCE = Decimal('0.0001')
@@ -361,6 +361,9 @@ class EnhancedApp(base.App):
                   command=lambda: show_review_cases(self.root, self.out_var.get().strip()),
                   bg='#b45309', fg='white', font=('Tahoma', 11, 'bold'),
                   padx=18, pady=8).pack(side='right')
+        tk.Button(review_actions, text='سجل المراجعات السابقة',
+                  command=lambda: show_review_history(self.root),
+                  font=('Tahoma', 10), padx=12, pady=8).pack(side='right', padx=6)
 
     def run_compare(self):
         ref = self.ref_var.get().strip()
@@ -490,6 +493,8 @@ class EnhancedApp(base.App):
                 return
 
         super().run_auto_update()
+        if hasattr(self, 'update_app'):
+            self.update_app.options['on_review_file'] = self.out_var.set
 
 
 if __name__ == '__main__':

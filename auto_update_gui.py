@@ -10,6 +10,7 @@ from ctypes import wintypes
 from tkinter import ttk, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
+from decimal import Decimal
 from shutil import which
 
 from openpyxl import load_workbook
@@ -85,7 +86,7 @@ def _dpapi_unprotect(encoded):
 
 REVIEW_SHEETS = (
     'مراجعة مطابقة محتملة', 'تكرار ببرنامج الرعاية', 'تكرار بالموقع',
-    'غير موجود بالموقع', 'يحتاج تعديل', 'ملخص',
+    'سجل المراجعة', 'غير موجود بالموقع', 'يحتاج تعديل', 'ملخص',
 )
 
 
@@ -112,6 +113,110 @@ def read_review_cases(excel_path):
     return result
 
 
+def review_case_key(row):
+    return tuple(row.get(key, '') for key in
+                 ('رقم_وطني_كرامة', 'رقم_وطني_الرعاية', 'مبلغ_كرامة', 'مبلغ_الرعاية'))
+
+
+def save_review_decisions(excel_path, decisions, output_dir):
+    """Keep the original report and all candidates; add only explicitly approved updates."""
+    if not decisions:
+        return excel_path
+    wb = load_workbook(excel_path)
+    try:
+        updates = wb['يحتاج تعديل']
+        headers = [cell.value for cell in updates[1]]
+        existing_ids = {str(row[headers.index('الرقم_الوطني')])
+                        for row in updates.iter_rows(min_row=2, values_only=True)}
+        audit = wb['سجل المراجعة'] if 'سجل المراجعة' in wb.sheetnames else wb.create_sheet('سجل المراجعة')
+        audit_headers = ['التاريخ', 'القرار', 'رقم_وطني_كرامة', 'الاسم_في_كرامة',
+                         'مبلغ_كرامة', 'رقم_وطني_الرعاية', 'الاسم_في_الرعاية',
+                         'مبلغ_الرعاية', 'الحالة', 'ملف_المصدر']
+        if audit.max_row == 1 and audit.cell(1, 1).value is None:
+            audit.append(audit_headers)
+            audit.delete_rows(1)
+        approved_site = set()
+        approved_care = set()
+        for record in read_review_cases(excel_path).get('سجل المراجعة', []):
+            if record.get('القرار') == 'معتمد للإدخال':
+                approved_site.add(record['رقم_وطني_كرامة'])
+                approved_care.add(record['رقم_وطني_الرعاية'])
+        delta = Decimal('0')
+        for row, approved in decisions:
+            site_id = row['رقم_وطني_كرامة']
+            care_id = row['رقم_وطني_الرعاية']
+            if approved:
+                if site_id in existing_ids or site_id in approved_site or care_id in approved_care:
+                    raise ValueError('لا يمكن اعتماد أكثر من مطابقة لنفس الشخص. أعد المقارنة بعد تصحيح المصدر.')
+                old_amount = Decimal(row['مبلغ_كرامة'])
+                new_amount = Decimal(row['مبلغ_الرعاية'])
+                if not old_amount.is_finite() or not new_amount.is_finite() or new_amount < 0:
+                    raise ValueError('مبلغ الحالة غير صالح للإدخال.')
+                update = {
+                    'الرقم_الوطني': site_id, 'الاسم_في_الموقع': row['الاسم_في_كرامة'],
+                    'الاسم_في_برنامج_الرعاية': row['الاسم_في_الرعاية'],
+                    'المبلغ_في_الموقع': row['مبلغ_كرامة'], 'المبلغ_الفعلي': row['مبلغ_الرعاية'],
+                    'سبب': 'مطابقة محتملة معتمدة يدوياً',
+                    'تعليمات': 'إدخال مبلغ الرعاية بعد موافقة المستخدم؛ الحالة محفوظة في سجل المراجعة',
+                }
+                updates.append([update.get(key, '') for key in headers])
+                approved_site.add(site_id)
+                approved_care.add(care_id)
+                delta += new_amount - old_amount
+            audit_row = dict(row, التاريخ=datetime.now().isoformat(timespec='seconds'),
+                             القرار='معتمد للإدخال' if approved else 'مؤجل - لم يعتمد للإدخال',
+                             ملف_المصدر=Path(excel_path).name)
+            audit.append([audit_row.get(key, '') for key in audit_headers])
+        summary = wb['ملخص']
+        pending = sum(row['رقم_وطني_كرامة'] not in approved_site
+                      for row in read_review_cases(excel_path).get('مراجعة مطابقة محتملة', []))
+        for row in summary.iter_rows(min_row=2):
+            if row[0].value == 'المجموع_المتوقع_بعد_التعديل_الآلي':
+                row[1].value = format(Decimal(str(row[1].value)) + delta, 'f')
+            elif row[0].value == 'حالات_مراجعة_مطابقة_محتملة':
+                row[1].value = pending
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"مراجعة_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xlsx"
+        target = os.path.join(output_dir, filename)
+        wb.save(target)
+        return target
+    finally:
+        wb.close()
+
+
+def confirm_review_cases(parent, excel_path, output_dir):
+    cases = read_review_cases(excel_path)
+    reviewed = {review_case_key(row) for row in cases.get('سجل المراجعة', [])
+                if row.get('القرار') == 'معتمد للإدخال'}
+    selected_site = {key[0] for key in reviewed}
+    selected_care = {key[1] for key in reviewed}
+    decisions = []
+    for row in cases.get('مراجعة مطابقة محتملة', []):
+        if (review_case_key(row) in reviewed or row['رقم_وطني_كرامة'] in selected_site
+                or row['رقم_وطني_الرعاية'] in selected_care):
+            continue
+        prompt = (
+            'هذا الاسم يحتاج مراجعة قبل التعديل:\n\n'
+            f"كرامة: {row['الاسم_في_كرامة']}\n"
+            f"الرقم الوطني: {row['رقم_وطني_كرامة']} — المبلغ: {row['مبلغ_كرامة']}\n\n"
+            f"الرعاية: {row['الاسم_في_الرعاية']}\n"
+            f"الرقم الوطني: {row['رقم_وطني_الرعاية']} — المبلغ: {row['مبلغ_الرعاية']}\n\n"
+            f"سبب المراجعة: {row.get('الحالة', '')}\n\n"
+            'هل تأكدت أنه الشخص نفسه وتريد إدخال مبلغ الرعاية في صف كرامة؟\n'
+            'نعم: اعتماد المبلغ للإدخال. لا: تأجيل الحالة. إلغاء: إيقاف البدء.\n'
+            'سيبقى الاسم والرقمان والمبلغان وقرارك محفوظة في سجل المراجعة.\n'
+            'الاعتماد يخص المبلغ فقط؛ لتصحيح الرقم الوطني صحح ملف المصدر وأعد المقارنة.'
+        )
+        approved = messagebox.askyesnocancel('مراجعة اسم قبل الإدخال', prompt, parent=parent)
+        if approved is None:
+            return None
+        decisions.append((row, approved))
+        if approved:
+            selected_site.add(row['رقم_وطني_كرامة'])
+            selected_care.add(row['رقم_وطني_الرعاية'])
+    return save_review_decisions(excel_path, decisions, output_dir)
+
+
 class ReviewCasesWindow:
     """Browse every reported issue, including protected potential matches."""
 
@@ -129,7 +234,7 @@ class ReviewCasesWindow:
 
         tk.Label(self.win, text='مراجعة مشاكل المقارنة داخل البرنامج',
                  font=('Tahoma', 14, 'bold'), bg='#2f4358', fg='white', pady=10).pack(fill=tk.X)
-        tk.Label(self.win, text='قارن البيانات وصحح المصدر ثم أعد المقارنة. الحالات المشتبهة مستبعدة من التعديل الآلي.',
+        tk.Label(self.win, text='الحالات غير المعتمدة مستبعدة من التعديل الآلي. قرارات الإدخال محفوظة ضمن «سجل المراجعة».',
                  font=('Tahoma', 10), wraplength=720, justify='right').pack(fill=tk.X, padx=10, pady=6)
         controls = tk.Frame(self.win)
         controls.pack(fill=tk.X, padx=10, pady=4)
@@ -243,6 +348,39 @@ def show_review_cases(parent, excel_path):
         messagebox.showinfo('مراجعة الحالات', 'لا توجد حالات للمراجعة في هذا الملف.', parent=parent)
         return
     return ReviewCasesWindow(parent, cases)
+
+
+def show_review_history(parent):
+    directory = Path(writable_app_dir()) / 'reviews'
+    files = sorted(directory.glob('مراجعة_*.xlsx'), reverse=True)
+    if not files:
+        messagebox.showinfo('سجل المراجعات', 'لا توجد مراجعات محفوظة بعد.', parent=parent)
+        return
+    win = tk.Toplevel(parent)
+    win.title('سجل المراجعات المحفوظة')
+    win.geometry('680x400')
+    tk.Label(win, text='اختر مراجعة سابقة لعرض الأسماء والقرارات',
+             font=('Tahoma', 12, 'bold')).pack(pady=10)
+    frame = tk.Frame(win)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10)
+    listing = tk.Listbox(frame, font=('Tahoma', 10), exportselection=False)
+    scrollbar = ttk.Scrollbar(frame, orient='vertical', command=listing.yview)
+    listing.configure(yscrollcommand=scrollbar.set)
+    listing.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    for file in files:
+        listing.insert(tk.END, file.name)
+    listing.selection_set(0)
+
+    def open_selected(*_):
+        selection = listing.curselection()
+        if selection:
+            viewer = show_review_cases(win, str(files[selection[0]]))
+            if viewer and 'سجل المراجعة' in viewer.cases:
+                viewer.category.set('سجل المراجعة')
+                viewer.refresh()
+    listing.bind('<Double-1>', open_selected)
+    tk.Button(win, text='عرض المراجعة', command=open_selected).pack(pady=8)
 
 
 class AutoUpdateGUI:
@@ -362,6 +500,7 @@ class AutoUpdateGUI:
             'expected_after_auto': '',
             'care_total': '',
             'reliable': '',
+            'approved_review': 0,
         }
         if not self.excel_path or not os.path.isfile(self.excel_path):
             return result
@@ -376,6 +515,13 @@ class AutoUpdateGUI:
             result['updates'] = self._sheet_data_rows(sheet('يحتاج تعديل'))
             result['zero_updates'] = self._sheet_data_rows(sheet('غير موجود ببرنامج الرعاية'))
             result['review_candidates'] = self._sheet_data_rows(sheet('مراجعة مطابقة محتملة'))
+            audit = sheet('سجل المراجعة')
+            if audit:
+                audit_rows = iter(audit.iter_rows(values_only=True))
+                audit_headers = list(next(audit_rows, ()))
+                if 'القرار' in audit_headers:
+                    decision_col = audit_headers.index('القرار')
+                    result['approved_review'] = sum(row[decision_col] == 'معتمد للإدخال' for row in audit_rows)
             result['missing_in_site'] = self._sheet_data_rows(sheet('غير موجود بالموقع'))
 
             summary_ws = sheet('ملخص')
@@ -587,6 +733,9 @@ class AutoUpdateGUI:
                   command=lambda: show_review_cases(self.root, self.excel_path),
                   bg='#b45309', fg='white', font=('Tahoma', 10, 'bold'),
                   padx=10, pady=5).pack(side=tk.BOTTOM, anchor='e', pady=4)
+        tk.Button(summary_box, text='سجل المراجعات السابقة',
+                  command=lambda: show_review_history(self.root),
+                  font=('Tahoma', 9), padx=10, pady=4).pack(side=tk.BOTTOM, anchor='e')
 
         summary_items = [
             ('يحتاج تعديل', self.summary_updates_var),
@@ -762,6 +911,7 @@ class AutoUpdateGUI:
             f'يحتاج تعديل: {s.get("updates", 0)}',
             f'منها تعديل إلى صفر: {s.get("zero_updates", 0)}',
             f'مطابقة محتملة تحتاج مراجعة: {s.get("review_candidates", 0)}',
+            f'حالات اعتمدتها يدوياً للإدخال: {s.get("approved_review", 0)}',
             f'موجود بالرعاية وغير موجود بكرامة: {s.get("missing_in_site", 0)}',
         ]
         if s.get('expected_after_auto'):
@@ -811,6 +961,22 @@ class AutoUpdateGUI:
             if self.remember_credentials_var.get():
                 messagebox.showerror('تعذر حفظ بيانات الدخول', f'لم أستطع حفظ بيانات الدخول بأمان:\n{exc}')
                 return
+
+        try:
+            reviewed_path = confirm_review_cases(self.root, self.excel_path,
+                                                os.path.join(self.runtime_dir, 'reviews'))
+            if reviewed_path is None:
+                return
+            if reviewed_path != self.excel_path:
+                self.excel_path = reviewed_path
+                self.file_label.config(text=Path(reviewed_path).name)
+                callback = self.options.get('on_review_file')
+                if callback:
+                    callback(reviewed_path)
+            self._refresh_summary()
+        except Exception as exc:
+            messagebox.showerror('تعذر اعتماد المراجعة', str(exc), parent=self.root)
+            return
 
         if not messagebox.askyesno('تأكيد بدء التشغيل', self._confirmation_text(year, month, category)):
             return

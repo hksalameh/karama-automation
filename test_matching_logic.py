@@ -72,16 +72,20 @@ import os
 import tempfile
 from pathlib import Path
 from openpyxl import Workbook
-from auto_update_gui import read_review_cases, ReviewCasesWindow
+from auto_update_gui import (read_review_cases, ReviewCasesWindow,
+                             save_review_decisions, confirm_review_cases)
 
 with tempfile.TemporaryDirectory() as folder:
     path = Path(folder) / 'review.xlsx'
     wb = Workbook()
     ws = wb.active
     ws.title = 'مراجعة مطابقة محتملة'
-    ws.append(['رقم_وطني_كرامة', 'الاسم_في_كرامة', 'رقم_وطني_الرعاية', 'الحالة'])
-    ws.append(['0012345678', 'محمد عبدالله احمد', '0012345679', 'اختلاف الرقم الوطني'])
-    ws.append(['0098765432', 'نور خالد احمد', '0098765433', 'تشابه الاسم'])
+    ws.append(['رقم_وطني_كرامة', 'الاسم_في_كرامة', 'رقم_وطني_الرعاية', 'الحالة',
+               'مبلغ_كرامة', 'مبلغ_الرعاية', 'الاسم_في_الرعاية'])
+    ws.append(['0012345678', 'محمد عبدالله احمد', '0012345679', 'اختلاف الرقم الوطني',
+               '20', '30', 'محمد عبد الله احمد'])
+    ws.append(['0098765432', 'نور خالد احمد', '0098765433', 'تشابه الاسم',
+               '40', '50', 'نور خالد احمد'])
     ws.append([None, None, None, None])
     dup = wb.create_sheet('تكرار ببرنامج الرعاية')
     dup.append(['nat_id', 'name_ref', 'amount_ref'])
@@ -89,6 +93,11 @@ with tempfile.TemporaryDirectory() as folder:
     summary = wb.create_sheet('ملخص')
     summary.append(['البند', 'القيمة'])
     summary.append(['سلامة_إجمالي_الرعاية', 'لا - يوجد فرق'])
+    summary.append(['المجموع_المتوقع_بعد_التعديل_الآلي', '60'])
+    summary.append(['حالات_مراجعة_مطابقة_محتملة', 2])
+    updates = wb.create_sheet('يحتاج تعديل')
+    updates.append(['الرقم_الوطني', 'الاسم_في_الموقع', 'الاسم_في_برنامج_الرعاية',
+                    'المبلغ_في_الموقع', 'المبلغ_الفعلي', 'سبب', 'تعليمات'])
     wb.save(path)
     original = path.read_bytes()
     cases = read_review_cases(path)
@@ -97,6 +106,31 @@ with tempfile.TemporaryDirectory() as folder:
     assert cases['تكرار ببرنامج الرعاية'][0]['nat_id'] == '0012345679'
     assert cases['ملخص'][0]['القيمة'] == 'لا - يوجد فرق'
     assert path.read_bytes() == original
+
+    # Approval enters only the selected case; deferral stays protected and audited.
+    from unittest.mock import patch
+    with patch('auto_update_gui.messagebox.askyesnocancel', side_effect=[True, False]) as ask:
+        reviewed_path = confirm_review_cases(None, str(path), folder)
+        assert ask.call_count == 2
+    reviewed_cases = read_review_cases(reviewed_path)
+    assert len(reviewed_cases['مراجعة مطابقة محتملة']) == 2
+    assert len(reviewed_cases['يحتاج تعديل']) == 1
+    assert reviewed_cases['يحتاج تعديل'][0]['الرقم_الوطني'] == '0012345678'
+    assert reviewed_cases['يحتاج تعديل'][0]['المبلغ_الفعلي'] == '30'
+    audit = reviewed_cases['سجل المراجعة']
+    assert [row['القرار'] for row in audit] == ['معتمد للإدخال', 'مؤجل - لم يعتمد للإدخال']
+    values = {row['البند']: row['القيمة'] for row in reviewed_cases['ملخص']}
+    assert Decimal(values['المجموع_المتوقع_بعد_التعديل_الآلي']) == Decimal('70')
+    assert values['حالات_مراجعة_مطابقة_محتملة'] == '1'
+    assert path.read_bytes() == original
+    with patch('auto_update_gui.messagebox.askyesnocancel', return_value=None) as ask:
+        assert confirm_review_cases(None, reviewed_path, folder) is None
+        assert ask.call_count == 1  # approved case is not added again
+    try:
+        save_review_decisions(reviewed_path, [(cases['مراجعة مطابقة محتملة'][0], True)], folder)
+        raise AssertionError('duplicate approval was accepted')
+    except ValueError:
+        pass
 
     # The Windows build runner can exercise real Tk widgets and clipboard.
     if os.name == 'nt' or os.environ.get('DISPLAY'):
