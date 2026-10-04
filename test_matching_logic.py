@@ -163,6 +163,31 @@ with tempfile.TemporaryDirectory() as folder:
             assert root.clipboard_get() == '0012345679'
             panel = tk.Frame(root)
             automation = AutoUpdateGUI(panel, str(path), {})
+            # Reset clears only session data and preserves a completed browser.
+            from unittest.mock import Mock
+            app.ref_var.set('old-reference.xlsx')
+            app.site_var.set('old-site.xlsx')
+            app.out_var.set(str(path))
+            app.needs_update_df = pd.DataFrame([{'الرقم_الوطني': '0012345678'}])
+            app.set_review_mode('all')
+            app.update_app = automation
+            app.update_frame = panel
+            automation.options['on_new_comparison'] = app.reset_comparison
+            automation.running = True
+            with patch('auto_update_gui.messagebox.showwarning') as warning:
+                automation.new_comparison()
+                assert warning.called
+                assert app.ref_var.get() == 'old-reference.xlsx'
+            automation.completed_temp_save = True
+            automation.process = Mock()
+            automation.process.poll.return_value = None
+            automation.new_comparison()
+            assert not app.ref_var.get() and not app.site_var.get() and not app.out_var.get()
+            assert app.review_df.empty and not app.tree.get_children()
+            assert not app.v_nat.get() and not app.v_reason.get()
+            assert panel.winfo_exists()
+            automation.process.terminate.assert_not_called()
+            assert not hasattr(app, 'update_app')
             window.win.destroy()
         finally:
             root.destroy()

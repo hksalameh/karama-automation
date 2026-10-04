@@ -364,6 +364,39 @@ class EnhancedApp(base.App):
         tk.Button(review_actions, text='سجل المراجعات السابقة',
                   command=lambda: show_review_history(self.root),
                   font=('Tahoma', 10), padx=12, pady=8).pack(side='right', padx=6)
+        tk.Button(review_actions, text='بدء مقارنة جديدة',
+                  command=self.reset_comparison, bg=self.c_primary, fg='white',
+                  font=('Tahoma', 10, 'bold'), padx=12, pady=8).pack(side='left')
+
+    def reset_comparison(self):
+        session = getattr(self, 'update_app', None)
+        if session and session.running and not session.completed_temp_save:
+            messagebox.showwarning('العملية تعمل', 'انتظر انتهاء العملية أو ألغِ التشغيل أولاً قبل بدء مقارنة جديدة.')
+            return
+
+        # Keep a completed browser session alive for the user's final review.
+        # Its reader still needs its Tk frame until the browser is closed.
+        frame = getattr(self, 'update_frame', None)
+        if frame is not None and frame.winfo_exists():
+            if session and session.process and session.process.poll() is None:
+                frame.place_forget()
+                if not hasattr(self, '_previous_sessions'):
+                    self._previous_sessions = []
+                self._previous_sessions.append((session, frame))
+            else:
+                frame.destroy()
+        for attr in ('update_app', 'update_frame'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        for variable in (self.ref_var, self.site_var, self.out_var):
+            variable.set('')
+        for attr in ('needs_update_df', 'missing_df', 'amount_diff_df', 'missing_site_df'):
+            setattr(self, attr, pd.DataFrame())
+        self.current_idx = 0
+        self.set_review_mode('all')
+        self.status.config(text='جاهز - اختر ملفات المقارنة الجديدة')
+        self.main_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
     def run_compare(self):
         ref = self.ref_var.get().strip()
@@ -495,6 +528,7 @@ class EnhancedApp(base.App):
         super().run_auto_update()
         if hasattr(self, 'update_app'):
             self.update_app.options['on_review_file'] = self.out_var.set
+            self.update_app.options['on_new_comparison'] = self.reset_comparison
 
 
 if __name__ == '__main__':

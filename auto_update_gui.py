@@ -788,6 +788,12 @@ class AutoUpdateGUI:
         )
         self.back_btn.pack(side=tk.RIGHT, padx=4)
 
+        self.new_comparison_btn = tk.Button(
+            content, text='بدء مقارنة جديدة', command=self.new_comparison,
+            bg='#2f4358', fg='white', font=('Tahoma', 10, 'bold'), padx=16, pady=7
+        )
+        self.new_comparison_btn.pack(anchor='e', pady=4)
+
         progress_box = tk.LabelFrame(
             content, text='حالة التنفيذ',
             font=('Tahoma', 11, 'bold'), fg='#2f4358', bg='white', padx=10, pady=8
@@ -1194,3 +1200,13 @@ class AutoUpdateGUI:
             on_back()
         else:
             self.root.destroy()
+
+    def new_comparison(self):
+        if self.running and not self.completed_temp_save:
+            messagebox.showwarning('العملية تعمل', 'انتظر انتهاء العملية أو ألغِ التشغيل أولاً قبل بدء مقارنة جديدة.')
+            return
+        callback = self.options.get('on_new_comparison')
+        if callback:
+            callback()
+        else:
+            self.go_back()
