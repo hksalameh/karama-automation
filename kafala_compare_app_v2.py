@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 import kafala_compare_app as base
+from auto_update_gui import show_review_cases
 
 
 TOTAL_TOLERANCE = Decimal('0.0001')
@@ -176,7 +177,8 @@ def build_review_candidates(unmatched_site, unmatched_ref):
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         best_score = candidates[0][0]
-        selected = [c for c in candidates if c[0] >= best_score - 0.035][:5]
+        # Identical names remain ambiguous even when one ID has fewer digit errors.
+        selected = [c for c in candidates if c[3] or c[0] >= best_score - 0.035][:5]
         ambiguous = len(selected) > 1
 
         for score, sim, diff, exact_compact, r in selected:
@@ -350,6 +352,16 @@ base.compare_and_export = enhanced_compare_and_export
 
 
 class EnhancedApp(base.App):
+    def __init__(self, root):
+        super().__init__(root)
+        # A separate row keeps this action visible even on narrower screens.
+        review_actions = tk.Frame(self.main_frame, bg=self.c_bg)
+        review_actions.grid(row=8, column=0, columnspan=3, sticky='ew', padx=8, pady=6)
+        tk.Button(review_actions, text='مراجعة الحالات والمشاكل',
+                  command=lambda: show_review_cases(self.root, self.out_var.get().strip()),
+                  bg='#b45309', fg='white', font=('Tahoma', 11, 'bold'),
+                  padx=18, pady=8).pack(side='right')
+
     def run_compare(self):
         ref = self.ref_var.get().strip()
         site = self.site_var.get().strip()
@@ -376,7 +388,7 @@ class EnhancedApp(base.App):
                 review_note = (
                     f"\n⚠ حالات مطابقة محتملة تحتاج مراجعة يدوية: {s['review_candidates']}\n"
                     'تم استبعادها من التصفير والإضافة والتعديل الآلي.\n'
-                    'راجع ورقة: مراجعة مطابقة محتملة\n'
+                    'اضغط «مراجعة الحالات والمشاكل» داخل البرنامج لعرضها.\n'
                 )
 
             if s['care_total_guard'].startswith('لا'):

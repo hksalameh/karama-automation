@@ -66,3 +66,71 @@ ref_dup = pd.DataFrame([
 assert detail_total_including_duplicates(ref_unique, ref_dup) == Decimal('34')
 
 print('matching and total safety tests passed')
+
+# Review data must stay accessible in-app without changing the workbook or IDs.
+import os
+import tempfile
+from pathlib import Path
+from openpyxl import Workbook
+from auto_update_gui import read_review_cases, ReviewCasesWindow
+
+with tempfile.TemporaryDirectory() as folder:
+    path = Path(folder) / 'review.xlsx'
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'مراجعة مطابقة محتملة'
+    ws.append(['رقم_وطني_كرامة', 'الاسم_في_كرامة', 'رقم_وطني_الرعاية', 'الحالة'])
+    ws.append(['0012345678', 'محمد عبدالله احمد', '0012345679', 'اختلاف الرقم الوطني'])
+    ws.append(['0098765432', 'نور خالد احمد', '0098765433', 'تشابه الاسم'])
+    ws.append([None, None, None, None])
+    dup = wb.create_sheet('تكرار ببرنامج الرعاية')
+    dup.append(['nat_id', 'name_ref', 'amount_ref'])
+    dup.append(['0012345679', 'محمد عبدالله احمد', 24])
+    summary = wb.create_sheet('ملخص')
+    summary.append(['البند', 'القيمة'])
+    summary.append(['سلامة_إجمالي_الرعاية', 'لا - يوجد فرق'])
+    wb.save(path)
+    original = path.read_bytes()
+    cases = read_review_cases(path)
+    assert len(cases['مراجعة مطابقة محتملة']) == 2
+    assert cases['مراجعة مطابقة محتملة'][0]['رقم_وطني_كرامة'] == '0012345678'
+    assert cases['تكرار ببرنامج الرعاية'][0]['nat_id'] == '0012345679'
+    assert cases['ملخص'][0]['القيمة'] == 'لا - يوجد فرق'
+    assert path.read_bytes() == original
+
+    # The Windows build runner can exercise real Tk widgets and clipboard.
+    if os.name == 'nt' or os.environ.get('DISPLAY'):
+        import tkinter as tk
+        from kafala_compare_app_v2 import EnhancedApp
+        from auto_update_gui import AutoUpdateGUI
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = EnhancedApp(root)
+            window = ReviewCasesWindow(root, cases)
+            root.update_idletasks()
+            assert len(window.tree.get_children()) == 2
+            window.move(1)
+            assert window.tree.selection() == ('1',)
+            window.copy_number('site')
+            assert root.clipboard_get() == '0098765432'
+            window.copy_number('care')
+            assert root.clipboard_get() == '0098765433'
+            window.query.set('محمد')
+            assert len(window.tree.get_children()) == 1
+            assert '0012345678' in window.details.get('1.0', tk.END)
+            window.query.set('لا يوجد هذا الاسم')
+            assert len(window.tree.get_children()) == 0
+            window.move(1)
+            window.query.set('')
+            window.category.set('تكرار ببرنامج الرعاية')
+            window.refresh()
+            window.copy_number('care')
+            assert root.clipboard_get() == '0012345679'
+            panel = tk.Frame(root)
+            automation = AutoUpdateGUI(panel, str(path), {})
+            window.win.destroy()
+        finally:
+            root.destroy()
+    assert path.read_bytes() == original
+print('in-app review data tests passed')

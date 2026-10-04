@@ -83,6 +83,168 @@ def _dpapi_unprotect(encoded):
         kernel32.LocalFree(out_blob.pbData)
 
 
+REVIEW_SHEETS = (
+    'مراجعة مطابقة محتملة', 'تكرار ببرنامج الرعاية', 'تكرار بالموقع',
+    'غير موجود بالموقع', 'يحتاج تعديل', 'ملخص',
+)
+
+
+def read_review_cases(excel_path):
+    """Read review data without modifying the comparison workbook."""
+    result = {}
+    wb = load_workbook(excel_path, read_only=True, data_only=True)
+    try:
+        for name in REVIEW_SHEETS:
+            if name not in wb.sheetnames:
+                continue
+            rows = iter(wb[name].iter_rows(values_only=True))
+            headers = next(rows, ())
+            records = []
+            for row in rows:
+                if not any(value not in (None, '') for value in row):
+                    continue
+                records.append({str(key): '' if value is None else str(value)
+                                for key, value in zip(headers, row) if key is not None})
+            if records:
+                result[name] = records
+    finally:
+        wb.close()
+    return result
+
+
+class ReviewCasesWindow:
+    """Browse every reported issue, including protected potential matches."""
+
+    def __init__(self, parent, cases):
+        self.cases = cases
+        self.records = []
+        self.win = tk.Toplevel(parent)
+        self.win.title('مراجعة حالات المقارنة')
+        self.win.geometry('1080x720')
+        self.win.minsize(760, 560)
+        self.win.transient(parent.winfo_toplevel())
+        self.category = tk.StringVar(value=next(iter(cases)))
+        self.query = tk.StringVar()
+        self.counter = tk.StringVar()
+
+        tk.Label(self.win, text='مراجعة مشاكل المقارنة داخل البرنامج',
+                 font=('Tahoma', 14, 'bold'), bg='#2f4358', fg='white', pady=10).pack(fill=tk.X)
+        tk.Label(self.win, text='قارن البيانات وصحح المصدر ثم أعد المقارنة. الحالات المشتبهة مستبعدة من التعديل الآلي.',
+                 font=('Tahoma', 10), wraplength=720, justify='right').pack(fill=tk.X, padx=10, pady=6)
+        controls = tk.Frame(self.win)
+        controls.pack(fill=tk.X, padx=10, pady=4)
+        tk.Label(controls, text='نوع الحالات:').pack(side=tk.RIGHT)
+        combo = ttk.Combobox(controls, textvariable=self.category, values=list(cases),
+                             state='readonly', justify='right', width=30)
+        combo.pack(side=tk.RIGHT, padx=6)
+        combo.bind('<<ComboboxSelected>>', self.refresh)
+        tk.Label(controls, text='بحث بالاسم أو الرقم:').pack(side=tk.RIGHT, padx=6)
+        tk.Entry(controls, textvariable=self.query, justify='right').pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        self.query.trace_add('write', self.refresh)
+
+        listing = tk.Frame(self.win)
+        listing.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.tree = ttk.Treeview(listing, show='headings', selectmode='browse', height=7)
+        vertical = ttk.Scrollbar(listing, orient='vertical', command=self.tree.yview)
+        horizontal = ttk.Scrollbar(listing, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vertical.grid(row=0, column=1, sticky='ns')
+        horizontal.grid(row=1, column=0, sticky='ew')
+        listing.grid_rowconfigure(0, weight=1)
+        listing.grid_columnconfigure(0, weight=1)
+        self.tree.bind('<<TreeviewSelect>>', self.show_selected)
+
+        details = tk.LabelFrame(self.win, text='تفاصيل الحالة المختارة — كرامة والرعاية', padx=8, pady=6)
+        details.pack(fill=tk.X, padx=10, pady=4)
+        self.details = scrolledtext.ScrolledText(details, height=10, font=('Tahoma', 11), wrap=tk.WORD)
+        self.details.tag_configure('rtl', justify='right')
+        self.details.pack(fill=tk.BOTH, expand=True)
+        self.details.configure(state=tk.DISABLED)
+        actions = tk.Frame(self.win)
+        actions.pack(fill=tk.X, padx=10, pady=8)
+        tk.Label(actions, textvariable=self.counter).pack(side=tk.RIGHT, padx=8)
+        tk.Button(actions, text='السابق', command=lambda: self.move(-1)).pack(side=tk.RIGHT, padx=4)
+        tk.Button(actions, text='التالي', command=lambda: self.move(1)).pack(side=tk.RIGHT, padx=4)
+        tk.Button(actions, text='نسخ رقم كرامة', command=lambda: self.copy_number('site')).pack(side=tk.RIGHT, padx=4)
+        tk.Button(actions, text='نسخ رقم الرعاية', command=lambda: self.copy_number('care')).pack(side=tk.RIGHT, padx=4)
+        tk.Button(actions, text='إغلاق', command=self.win.destroy).pack(side=tk.LEFT)
+        self.refresh()
+
+    def refresh(self, *_):
+        query = self.query.get().strip().casefold()
+        self.records = [row for row in self.cases[self.category.get()]
+                        if not query or any(query in value.casefold() for value in row.values())]
+        self.tree.delete(*self.tree.get_children())
+        headers = list(self.cases[self.category.get()][0])
+        columns = [str(i) for i in range(len(headers))]
+        self.tree.configure(columns=columns)
+        for column, title in zip(columns, headers):
+            self.tree.heading(column, text=title.replace('_', ' '))
+            self.tree.column(column, width=220 if 'اسم' in title or 'حالة' in title else 160, anchor='e', stretch=False)
+        for i, row in enumerate(self.records):
+            self.tree.insert('', tk.END, iid=str(i), values=[row.get(key, '') for key in headers])
+        if self.records:
+            self.tree.selection_set('0')
+            self.tree.focus('0')
+        self.show_selected()
+
+    def show_selected(self, *_):
+        selection = self.tree.selection()
+        row = self.records[int(selection[0])] if selection else {}
+        self.counter.set(f'الحالة {int(selection[0]) + 1} من {len(self.records)}' if selection else 'لا توجد حالات لهذا البحث')
+        self.details.configure(state=tk.NORMAL)
+        self.details.delete('1.0', tk.END)
+        self.details.insert(tk.END, '\n'.join(f"{key.replace('_', ' ')}: {value}" for key, value in row.items()), 'rtl')
+        self.details.configure(state=tk.DISABLED)
+
+    def move(self, delta):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        index = max(0, min(len(self.records) - 1, int(selection[0]) + delta))
+        self.tree.selection_set(str(index))
+        self.tree.focus(str(index))
+        self.tree.see(str(index))
+        self.show_selected()
+
+    def copy_number(self, source):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        row = self.records[int(selection[0])]
+        if source == 'site':
+            number = row.get('رقم_وطني_كرامة', '')
+            if self.category.get() not in ('تكرار ببرنامج الرعاية', 'غير موجود بالموقع'):
+                number = number or row.get('الرقم_الوطني', '') or row.get('nat_id', '')
+        else:
+            number = row.get('رقم_وطني_الرعاية', '')
+            if self.category.get() == 'تكرار ببرنامج الرعاية':
+                number = number or row.get('nat_id', '')
+            if row.get('الاسم_في_برنامج_الرعاية', '') not in ('', 'غير موجود ببرنامج الرعاية'):
+                number = number or row.get('الرقم_الوطني', '')
+        if number:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(number)
+        else:
+            messagebox.showinfo('نسخ الرقم', 'لا يوجد رقم لهذا المصدر في الحالة المختارة.', parent=self.win)
+
+
+def show_review_cases(parent, excel_path):
+    if not excel_path or not os.path.isfile(excel_path):
+        messagebox.showinfo('مراجعة الحالات', 'نفّذ المقارنة أولاً أو اختر ملف نتيجة المقارنة.', parent=parent)
+        return
+    try:
+        cases = read_review_cases(excel_path)
+    except Exception as exc:
+        messagebox.showerror('مراجعة الحالات', f'تعذر قراءة حالات المراجعة:\n{exc}', parent=parent)
+        return
+    if not cases:
+        messagebox.showinfo('مراجعة الحالات', 'لا توجد حالات للمراجعة في هذا الملف.', parent=parent)
+        return
+    return ReviewCasesWindow(parent, cases)
+
+
 class AutoUpdateGUI:
     """واجهة كرامة: مراجعة موجزة، تعديل آلي، حفظ مؤقت فقط، وسجل تشغيل محلي."""
 
@@ -420,6 +582,11 @@ class AutoUpdateGUI:
             font=('Tahoma', 11, 'bold'), fg='#2f4358', bg='white', padx=8, pady=6
         )
         summary_box.pack(fill=tk.X, pady=6)
+
+        tk.Button(summary_box, text='مراجعة الحالات والمشاكل',
+                  command=lambda: show_review_cases(self.root, self.excel_path),
+                  bg='#b45309', fg='white', font=('Tahoma', 10, 'bold'),
+                  padx=10, pady=5).pack(side=tk.BOTTOM, anchor='e', pady=4)
 
         summary_items = [
             ('يحتاج تعديل', self.summary_updates_var),
