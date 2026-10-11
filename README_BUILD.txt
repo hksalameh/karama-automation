@@ -35,6 +35,7 @@ Current monthly workflow:
 14. The program confirms the message تم حفظ القيم بنجاح.
 15. The browser stays open for the user to review the total.
 16. حفظ نهائي is always manual and must never be clicked by the automation.
+ملاحظة: حفظ نهائي يبقى يدويًا دائمًا، ولا ينقر البرنامج عليه آليًا.
 
 Business rules:
 - Program الرعاية is the authoritative monthly balance source.
