@@ -65,6 +65,15 @@ ref_dup = pd.DataFrame([
 ])
 assert detail_total_including_duplicates(ref_unique, ref_dup) == Decimal('34')
 
+# Preserve exact fils precision when duplicate national IDs include leading zeros.
+ref_unique = pd.DataFrame([row_ref('0012345678', 'A', '0.10')])
+ref_dup = pd.DataFrame([
+    row_ref('0012345678', 'A', '0.10'),
+    row_ref('0012345678', 'A', '0.20'),
+])
+assert detail_total_including_duplicates(ref_unique, ref_dup) == Decimal('0.30')
+
+
 print('matching and total safety tests passed')
 
 # Review data must stay accessible in-app without changing the workbook or IDs.
